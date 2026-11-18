@@ -876,7 +876,7 @@ private:
 	{
 		if (piCount == NULL || piSize == NULL) DebugLog("[GetNumberOfCapabilities] E_POINTER\n");
 		if (piCount == NULL || piSize == NULL) return E_POINTER;
-		*piCount = (sizeof(_media)/sizeof(_media[0])*2); //RGB and RGBA variations
+		*piCount = (sizeof(_media)/sizeof(_media[0])*3); //NV12, YUY2 and RGB24 variations
 		*piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS);
 		DebugLog("[GetNumberOfCapabilities] Returning Count: %d - Size: %d\n", *piCount, *piSize);
 		return S_OK;
@@ -963,11 +963,13 @@ private:
 		CheckPointer(pMediaType, E_POINTER);
 		if (iPos < 0) return E_INVALIDARG;
 		const int nMedia = (int)(sizeof(_media)/sizeof(_media[0]));
-		if (iPos >= nMedia * 2) return VFW_S_NO_MORE_ITEMS;
+		if (iPos >= nMedia * 3) return VFW_S_NO_MORE_ITEMS;
 		CAutoLock cAutoLock(m_pFilter->pStateLock()); 
 
-		const int iMedia = iPos / 2;
-		const bool nv12 = ((iPos % 2) == 0);
+		const int iMedia = iPos / 3;
+		const int variant = iPos % 3;
+		const bool nv12 = (variant == 0);
+		const bool yuy2 = (variant == 1);
 		UCASSERT(_media[iMedia].width * _media[iMedia].height * 4 * sizeof(short) <= MAX_SHARED_IMAGE_SIZE);
 		VIDEOINFO *pvi = (VIDEOINFO *)pMediaType->AllocFormatBuffer(sizeof(VIDEOINFO));
 		ZeroMemory(pvi, sizeof(VIDEOINFO));
@@ -977,15 +979,15 @@ private:
 		pBmi->biWidth  = (_media[iMedia].width  ? _media[iMedia].width  : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biWidth );
 		pBmi->biHeight = (_media[iMedia].height ? _media[iMedia].height : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biHeight);
 		pBmi->biPlanes = 1;
-		pBmi->biBitCount = (nv12 ? 12 : 24);
-		pBmi->biCompression = (nv12 ? MAKEFOURCC('N', 'V', '1', '2') : BI_RGB);
-		pBmi->biSizeImage = (nv12 ? (pBmi->biWidth * pBmi->biHeight * 3 / 2) : (pBmi->biWidth * pBmi->biHeight * 3));
+		pBmi->biBitCount = (nv12 ? 12 : (yuy2 ? 16 : 24));
+		pBmi->biCompression = (nv12 ? MAKEFOURCC('N', 'V', '1', '2') : (yuy2 ? MAKEFOURCC('Y', 'U', 'Y', '2') : BI_RGB));
+		pBmi->biSizeImage = (nv12 ? (pBmi->biWidth * pBmi->biHeight * 3 / 2) : (yuy2 ? (pBmi->biWidth * pBmi->biHeight * 2) : (pBmi->biWidth * pBmi->biHeight * 3)));
 
 		//DebugLog("[GetMediaType] iPos: %d - WIDTH: %d - HEIGHT: %d - BITS: %d - TPS: %d\n", iPos, (int)pvi->bmiHeader.biWidth, (int)pvi->bmiHeader.biHeight, (int)pvi->bmiHeader.biBitCount, (int)pvi->AvgTimePerFrame);
 
 		pMediaType->SetType(&MEDIATYPE_Video);
 		pMediaType->SetFormatType(&FORMAT_VideoInfo);
-		pMediaType->SetSubtype(nv12 ? &MEDIASUBTYPE_NV12 : &MEDIASUBTYPE_RGB24);
+		pMediaType->SetSubtype(nv12 ? &MEDIASUBTYPE_NV12 : (yuy2 ? &MEDIASUBTYPE_YUY2 : &MEDIASUBTYPE_RGB24));
 		pMediaType->SetSampleSize(pBmi->biSizeImage);
 		pMediaType->SetTemporalCompression(FALSE);
 		return S_OK;
