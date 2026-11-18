@@ -34,6 +34,10 @@ build\obscure-gui.exe
 
 ## OBS 接入
 
+本机 OBS 32.0.2 便携版装在 `D:\obs-studio`，桌面和开始菜单快捷方式已恢复。
+Spout2 插件 **1.10.0** 放在 `C:\ProgramData\obs-studio\plugins`。
+注意：1.12.0 及以后要求 OBS 32.1+，在 32.0.2 上会报 “compiled with newer libobs”。
+
 ### 输出窗口（零插件，推荐）
 
 1. 编码端开启“输出窗口”，点“开始混淆”。
@@ -43,17 +47,20 @@ build\obscure-gui.exe
 
 ### Spout（需要插件）
 
-1. 安装 Spout2 插件（本机 OBS 32.0.2 已验证 1.10.0）。
+1. 安装 Spout2 插件 **1.10.0**（本机 OBS 32.0.2 已验证；1.12+ 需要 OBS 32.1+）。
 2. 编码端勾选 Spout，填写发送名。
 3. OBS 添加 **Spout2 Capture**，选择同名发送端。
 
 ### 虚拟摄像头
 
-当前状态：`OBScure Virtual Camera` 已注册为每用户 DirectShow 设备，优先输出 **NV12**，其次 YUY2，最后 RGB24。ffmpeg 以 1920×1080 / 60fps / NV12 采集已通过。
+当前状态：`OBScure Virtual Camera` 已注册为每用户 DirectShow 设备，优先输出 **NV12**，其次 YUY2，最后 RGB24。已实测通过：
 
-临时替代：
-- 在 OBS 里添加“视频采集设备”，选择 **OBScure Virtual Camera**，分辨率 1920×1080、帧率 60、格式 NV12。
-- 也可以用“输出窗口”让 OBS 采集，再启动 OBS 自带的虚拟摄像头。
+- ffmpeg：1920×1080 / 60fps / NV12，720p 缩放，YUY2
+- OBS 32.0.2：视频采集设备选择 **OBScure Virtual Camera**，NV12、1920×1080、60fps，画面正常
+
+用法：
+- OBS 添加“视频采集设备”，选择 **OBScure Virtual Camera**，分辨率 1920×1080、帧率 60、格式 NV12。
+- 备用路径：用“输出窗口”让 OBS 采集，再启动 OBS 自带的虚拟摄像头（本机也已注册）。
 
 ## 命令行（保留）
 
@@ -124,7 +131,7 @@ work\build_cli.bat
 - 8 Mbps 下还原画面仍有块边缘压缩纹；10 Mbps 明显更干净，这是 H.264 在分块边界上的固有限制。
 - 16px 块在 6–10 Mbps 下块噪声偏大，不建议作为默认。
 - 浏览器/硬件覆盖层窗口可能被 WGC 捕获为黑屏；优先用普通播放器窗口、OBS 投影或 `--monitor`。
-- 虚拟摄像头已通过 ffmpeg 1080p60 NV12 采集验证，OBS 32 待重装后验证。
+- 虚拟摄像头已通过 ffmpeg 和 OBS 32.0.2 的 1080p60 NV12 验证。
 - v1 只支持 SDR；HDR 需 tonemap；DRM 窗口可能捕获黑屏。
 - 还没有安装包；当前是本地测试版。
 
@@ -144,7 +151,7 @@ out/            测试产物
 
 ## 后续
 
-1. 用 OBS 32 验证 OBScure Virtual Camera 的 NV12/60fps 连接。
+1. 用 Spout 跑一次 OBS 全链路，再调画质与码率。
 2. 统一 GUI 的设置持久化、日志/崩溃提示、全屏预览细节。
 3. 安装包与便携版。
 4. 平台转码/二次编码全矩阵，再调画质与码率。

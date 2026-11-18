@@ -70,6 +70,12 @@ ffmpeg -f dshow -video_size 1920x1080 -framerate 60 -pixel_format nv12 ^
 
 已通过：1920×1080 / 60fps / NV12，1280×720 / 60fps / NV12。
 
+OBS 32.0.2 实测：添加“视频采集设备”，设备 `OBScure Virtual Camera`，
+格式 NV12、1920×1080、60fps，`videoActive=true`，画面方向正确。
+OBS 自己的虚拟摄像头也已注册，可作备用。
+
+Spout2 插件注意：OBS 32.0.2 只能用 **1.10.0**；1.12.0 起要求 OBS 32.1+。
+
 ## 已知注意点
 
 - 滤镜只输出 NV12、YUY2、RGB24，不再输出 ARGB32。
