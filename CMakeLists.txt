@@ -151,6 +151,26 @@ target_link_libraries(obscure-decode PRIVATE
     kernel32 user32 gdi32 shell32 ole32 oleaut32 uuid comdlg32
 )
 
+add_library(obscure-vcam SHARED
+    src/vcam/obscure_filter.cpp
+    third_party/UnityCapture/Source/streams.cpp
+)
+target_compile_definitions(obscure-vcam PRIVATE _WINDOWS _USRDLL)
+target_compile_options(obscure-vcam PRIVATE /permissive /Zc:strictStrings- /UNOMINMAX)
+target_include_directories(obscure-vcam PRIVATE
+    "${CMAKE_SOURCE_DIR}/third_party/UnityCapture/Source"
+)
+target_link_libraries(obscure-vcam PRIVATE
+    strmiids ole32 oleaut32 uuid user32 gdi32 advapi32 winmm version shlwapi
+)
+target_link_options(obscure-vcam PRIVATE
+    "/DEF:${CMAKE_SOURCE_DIR}/third_party/UnityCapture/Source/UnityCaptureFilter.def"
+)
+set_target_properties(obscure-vcam PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "obscure-vcam"
+)
+
 set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
 add_library(imgui STATIC
     "${IMGUI_DIR}/imgui.cpp"
@@ -207,10 +227,16 @@ target_link_libraries(obscure-gui PRIVATE
     opengl32 kernel32 user32 gdi32 winspool comdlg32 comctl32 advapi32 shell32
     ole32 oleaut32 uuid odbc32 odbccp32 d3d9 version winmm psapi
 )
+add_dependencies(obscure-gui obscure-vcam)
 add_custom_command(TARGET obscure-gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/shaders"
         "$<TARGET_FILE_DIR:obscure-gui>/shaders"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:obscure-gui>/vcam"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:obscure-vcam>"
+        "$<TARGET_FILE_DIR:obscure-gui>/vcam/obscure-vcam.dll"
 )
 
 add_executable(spout-smoke

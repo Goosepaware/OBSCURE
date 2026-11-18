@@ -2,7 +2,7 @@
 
 实时画面混淆 / 解混淆工具。编码端捕获窗口、显示器或视频文件，把画面中心切成带密钥的碎片并加上四角定位点和元数据；解码端捕获播放器窗口或文件，识别定位点后还原画面。
 
-当前是 **v0.2 可测试版**：统一 GUI、文件闭环、实时 GPU 编码/解码、窗口选择与实时预览、输出窗口、Spout 已跑通。虚拟摄像头仍在和 OBS 32 的 DirectShow 格式兼容性做适配，暂不开放。
+当前是 **v0.2 可测试版**：统一 GUI、文件闭环、实时 GPU 编码/解码、窗口选择与实时预览、输出窗口、Spout 已跑通。独立虚拟摄像头已支持 NV12/YUY2，1080p60 采集验证通过。
 
 ## 图形界面（推荐）
 
@@ -49,11 +49,11 @@ build\obscure-gui.exe
 
 ### 虚拟摄像头
 
-当前状态：本次恢复版本**不包含独立虚拟摄像头**。实验性 DirectShow 滤镜源码没有从会话记录中恢复，已从构建中移除，GUI 里保持禁用，避免影响 OBS 稳定性。请使用“输出窗口 + OBS 自带虚拟摄像头”的替代路径。
+当前状态：`OBScure Virtual Camera` 已注册为每用户 DirectShow 设备，优先输出 **NV12**，其次 YUY2，最后 RGB24。ffmpeg 以 1920×1080 / 60fps / NV12 采集已通过。
 
 临时替代：
-- 用“输出窗口”让 OBS 采集，然后在 OBS 里启动 **虚拟摄像头**（OBS 自带，不需要插件）。
-- 或者等后续版本修好独立虚拟摄像头。
+- 在 OBS 里添加“视频采集设备”，选择 **OBScure Virtual Camera**，分辨率 1920×1080、帧率 60、格式 NV12。
+- 也可以用“输出窗口”让 OBS 采集，再启动 OBS 自带的虚拟摄像头。
 
 ## 命令行（保留）
 
@@ -116,7 +116,7 @@ work\build_cli.bat
 - `build\obscure-cli.exe`：文件编码/解码 CLI
 - `build\obscure-decode.exe`：旧版 GPU 解码预览
 - `build\obscure-live.exe`：旧版实时编码 → Spout
-- `build\obscure-vcam.dll`：本次恢复版本未构建（实验性虚拟摄像头源码待恢复）
+- `build\obscure-vcam.dll`：DirectShow 虚拟摄像头滤镜（NV12/YUY2/RGB）
 
 ## 已知限制
 
@@ -124,7 +124,7 @@ work\build_cli.bat
 - 8 Mbps 下还原画面仍有块边缘压缩纹；10 Mbps 明显更干净，这是 H.264 在分块边界上的固有限制。
 - 16px 块在 6–10 Mbps 下块噪声偏大，不建议作为默认。
 - 浏览器/硬件覆盖层窗口可能被 WGC 捕获为黑屏；优先用普通播放器窗口、OBS 投影或 `--monitor`。
-- 虚拟摄像头暂未通过 OBS 32 的 DirectShow 兼容性验证。
+- 虚拟摄像头已通过 ffmpeg 1080p60 NV12 采集验证，OBS 32 待重装后验证。
 - v1 只支持 SDR；HDR 需 tonemap；DRM 窗口可能捕获黑屏。
 - 还没有安装包；当前是本地测试版。
 
@@ -134,7 +134,7 @@ work\build_cli.bat
 src/core/       布局、密钥、元数据、边框、CPU 变换、ArUco 检测
 src/live/       WGC 捕获、D3D11 管线、输出窗口、Spout、虚拟摄像头发送端
 src/gui/        ImGui + Win32 + D3D11 统一界面
-src/vcam/       本次恢复版本未包含（实验性虚拟摄像头滤镜）
+src/vcam/       独立 DirectShow 虚拟摄像头滤镜（NV12/YUY2/RGB）
 shaders/        transport.hlsl、decode.hlsl、blit.hlsl
 tools/proto/    Phase 0 Python 原型与码率测试
 tools/          OBS WebSocket / 测试脚本
@@ -144,7 +144,7 @@ out/            测试产物
 
 ## 后续
 
-1. 修虚拟摄像头与 OBS 32 的 NV12/60fps 协商。
+1. 用 OBS 32 验证 OBScure Virtual Camera 的 NV12/60fps 连接。
 2. 统一 GUI 的设置持久化、日志/崩溃提示、全屏预览细节。
 3. 安装包与便携版。
 4. 平台转码/二次编码全矩阵，再调画质与码率。

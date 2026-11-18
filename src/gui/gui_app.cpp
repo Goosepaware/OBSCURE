@@ -502,7 +502,7 @@ void GuiApp::Impl::apply_auto_start() {
         mode_ = Mode::Encode;
         enc_.out_window = true;
         enc_.out_spout = auto_spout_;
-        enc_.out_vcam = false;
+        enc_.out_vcam = auto_vcam_;
         enc_.out_record = auto_record_;
         if (hwnd) {
             enc_.source = EncodeState::Source::Window;
@@ -1012,12 +1012,9 @@ void GuiApp::Impl::draw_encode_outputs() {
             enc_.spout_name = name;
         }
     }
-    ImGui::BeginDisabled();
-    bool experimental_vcam = false;
-    ImGui::Checkbox("虚拟摄像头（实验性，暂不可用）", &experimental_vcam);
-    ImGui::EndDisabled();
-    ImGui::TextDisabled("OBS 32 的 DirectShow 输入存在 RGB/NV12 兼容问题，");
-    ImGui::TextDisabled("当前请用输出窗口，或 OBS 自带的虚拟摄像头。");
+    ImGui::Checkbox("虚拟摄像头（OBScure Virtual Camera）", &enc_.out_vcam);
+    ImGui::TextDisabled("独立 DirectShow 设备，输出 NV12（优先）/ YUY2 / RGB。");
+    ImGui::TextDisabled("OBS 里添加“视频采集设备”即可，不需要窗口采集。");
     ImGui::Checkbox("录制到文件", &enc_.out_record);
     if (enc_.out_record) {
         if (enc_.record_path.empty()) enc_.record_path = make_record_path();
