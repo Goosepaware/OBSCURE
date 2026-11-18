@@ -178,7 +178,7 @@ int adaptive_margin(const cv::Mat& H) {
     const double c = H.at<double>(1, 0);
     const double d = H.at<double>(1, 1);
     const double scale = std::sqrt(std::abs(a * d - b * c));
-    if (scale >= 1.05) return 1;  // upscaled capture: inset to avoid cell-edge bleed
+    if (scale > 1.005) return 1;  // any upscaled capture: inset to avoid cell-edge bleed
     if (scale >= 0.95) return 0;
     if (scale >= 0.65) return 1;
     return 2;
