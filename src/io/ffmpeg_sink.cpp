@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cwctype>
 #include <filesystem>
 #include <sstream>
 
@@ -50,7 +51,8 @@ FfmpegSink::~FfmpegSink() {
 
 bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int width,
                        int height, double fps, double bitrate_mbps,
-                       const std::wstring& output, std::string* error) {
+                       const std::wstring& output, std::string* error,
+                       VideoCodec codec) {
     stop();
     if (!device || !context || width <= 0 || height <= 0) {
         if (error) *error = "ffmpeg sink: bad frame size";
@@ -60,6 +62,7 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
     context_ = context;
     width_ = width;
     height_ = height;
+    codec_ = codec;
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = static_cast<UINT>(width_);
@@ -93,16 +96,29 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
                              OPEN_EXISTING, 0, nullptr);
 
     const double br = bitrate_mbps > 0 ? bitrate_mbps : 8.0;
+    std::wstring ext = std::filesystem::path(output).extension().wstring();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    const bool mp4_like = ext == L".mp4" || ext == L".mov";
+
     std::wostringstream cmd;
     cmd << quote_arg(find_ffmpeg())
         << L" -hide_banner -loglevel error -y"
         << L" -f rawvideo -pixel_format bgra -video_size " << width_ << L"x" << height_
-        << L" -framerate " << fps << L" -i - -an"
-        << L" -c:v libx264 -preset veryfast"
-        << L" -b:v " << br << L"M -minrate " << br << L"M -maxrate " << br
-        << L"M -bufsize " << (br * 2) << L"M -x264-params nal-hrd=cbr"
-        << L" -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 "
-        << quote_arg(output);
+        << L" -framerate " << fps << L" -i - -an";
+    if (codec_ == VideoCodec::H265) {
+        cmd << L" -c:v libx265 -preset medium"
+            << L" -b:v " << br << L"M -maxrate " << br << L"M -bufsize " << (br * 2)
+            << L"M"
+            << L" -x265-params keyint=60:min-keyint=60:scenecut=0:log-level=error";
+        if (mp4_like) cmd << L" -tag:v hvc1";
+    } else {
+        cmd << L" -c:v libx264 -preset veryfast"
+            << L" -b:v " << br << L"M -minrate " << br << L"M -maxrate " << br
+            << L"M -bufsize " << (br * 2) << L"M -x264-params nal-hrd=cbr"
+            << L" -keyint_min 60 -sc_threshold 0";
+    }
+    cmd << L" -pix_fmt yuv420p -g 60 " << quote_arg(output);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);

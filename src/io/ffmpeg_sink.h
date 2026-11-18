@@ -13,7 +13,12 @@
 
 namespace obs {
 
-// Encodes D3D11 BGRA frames to an H.264 MP4 through ffmpeg's stdin.
+enum class VideoCodec {
+    H264,
+    H265,
+};
+
+// Encodes D3D11 BGRA frames to an H.264/H.265 file through ffmpeg's stdin.
 // Readback and pipe writes happen on a worker; the render thread only copies
 // the texture into a staging resource and queues the pixels.
 class FfmpegSink {
@@ -25,7 +30,7 @@ public:
 
     bool start(ID3D11Device* device, ID3D11DeviceContext* context, int width, int height,
                double fps, double bitrate_mbps, const std::wstring& output,
-               std::string* error);
+               std::string* error, VideoCodec codec = VideoCodec::H264);
     void write(ID3D11Texture2D* texture);
     void stop();
     bool active() const { return process_ != nullptr; }
@@ -40,6 +45,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
     int width_ = 0;
     int height_ = 0;
+    VideoCodec codec_ = VideoCodec::H264;
     void* process_ = nullptr;
     void* stdin_write_ = nullptr;
     void* stderr_read_ = nullptr;

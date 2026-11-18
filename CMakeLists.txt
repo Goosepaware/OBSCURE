@@ -189,6 +189,7 @@ target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler dwmapi imm32)
 add_executable(obscure-gui
     src/gui/main.cpp
     src/gui/gui_app.cpp
+    src/gui/gui_settings.cpp
     src/platform/win_util.cpp
     src/core/layout.cpp
     src/core/key.cpp
@@ -202,6 +203,7 @@ add_executable(obscure-gui
     src/live/encode_pipeline.cpp
     src/live/decode_pipeline.cpp
     src/live/output_window.cpp
+    src/live/preview_window.cpp
     src/live/spout_sink.cpp
     src/live/file_source.cpp
     src/live/detection_worker.cpp

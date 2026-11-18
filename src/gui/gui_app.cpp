@@ -42,6 +42,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "core/layout.h"
 #include "core/metadata.h"
 #include "core/presets.h"
+#include "gui/gui_settings.h"
 #include "io/ffmpeg_sink.h"
 #include "live/d3d_helpers.h"
 #include "live/decode_pipeline.h"
@@ -49,6 +50,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "live/encode_pipeline.h"
 #include "live/file_source.h"
 #include "live/output_window.h"
+#include "live/preview_window.h"
 #include "live/shader_path.h"
 #include "live/spout_sink.h"
 #include "live/vcam_registry.h"
@@ -147,6 +149,63 @@ std::string window_label(const WindowInfo& info) {
     return os.str();
 }
 
+RECT clamp_window_rect(RECT rect, int min_w, int min_h) {
+    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        rect = {0, 0, min_w, min_h};
+    }
+    HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return rect;
+    const RECT work = info.rcWork;
+    const int work_w = work.right - work.left;
+    const int work_h = work.bottom - work.top;
+    const int width = std::clamp(static_cast<int>(rect.right - rect.left), min_w, work_w);
+    const int height = std::clamp(static_cast<int>(rect.bottom - rect.top), min_h, work_h);
+    const int x = std::clamp(static_cast<int>(rect.left), static_cast<int>(work.left),
+                             static_cast<int>(work.right) - width);
+    const int y = std::clamp(static_cast<int>(rect.top), static_cast<int>(work.top),
+                             static_cast<int>(work.bottom) - height);
+    return {x, y, x + width, y + height};
+}
+
+std::string format_time_ms(double ms) {
+    if (ms < 0) ms = 0;
+    const long long total = static_cast<long long>(ms / 1000.0);
+    const long long h = total / 3600;
+    const long long m = (total % 3600) / 60;
+    const long long s = total % 60;
+    char buffer[32]{};
+    if (h > 0) {
+        sprintf_s(buffer, "%lld:%02lld:%02lld", h, m, s);
+    } else {
+        sprintf_s(buffer, "%02lld:%02lld", m, s);
+    }
+    return buffer;
+}
+
+struct ExportFormat {
+    const char* label;
+    const char* extension;
+    const char* codec;
+};
+
+constexpr ExportFormat kExportFormats[] = {
+    {"MP4 / H.264", "mp4", "h264"},
+    {"MKV / H.264", "mkv", "h264"},
+    {"MOV / H.264", "mov", "h264"},
+    {"MP4 / H.265", "mp4", "h265"},
+    {"MKV / H.265", "mkv", "h265"},
+    {"MOV / H.265", "mov", "h265"},
+};
+constexpr int kExportFormatCount = static_cast<int>(std::size(kExportFormats));
+
+std::wstring replace_extension(std::wstring path, const std::string& extension) {
+    std::filesystem::path p(path);
+    p.replace_extension(L"." + utf8_to_wide(extension));
+    return p.wstring();
+}
+
 }  // namespace
 
 struct GuiApp::Impl {
@@ -189,6 +248,13 @@ struct GuiApp::Impl {
         Clock::time_point last_file_log{};
         Layout layout;
         KeyMaterial key;
+        bool player_dragging = false;
+        float player_pos = 0.0f;
+        Clock::time_point player_last_seek{};
+        double probe_duration_ms = 0.0;
+        double probe_fps = 60.0;
+        int probe_frames = 0;
+        bool probe_valid = false;
     };
 
     struct DecodeState {
@@ -240,6 +306,50 @@ struct GuiApp::Impl {
         Clock::time_point last_file_log{};
         Layout layout;
         KeyMaterial key;
+        bool player_dragging = false;
+        float player_pos = 0.0f;
+        Clock::time_point player_last_seek{};
+        double probe_duration_ms = 0.0;
+        double probe_fps = 60.0;
+        int probe_frames = 0;
+        bool probe_valid = false;
+    };
+
+    struct ExportState {
+        bool running = false;
+        bool cancel_requested = false;
+        bool for_decode = false;
+        std::wstring source_path;
+        std::wstring output_path;
+        std::string format = "mp4";
+        std::string codec = "h264";
+        int bitrate = 8;
+        int total_frames = 0;
+        int done_frames = 0;
+        double fps = 60.0;
+        int width = 0;
+        int height = 0;
+        bool pending_first_frame = false;
+        bool detection_mode = false;
+        int detect_failures = 0;
+        cv::Mat first_frame;
+        cv::Mat H;
+        Layout layout;
+        KeyMaterial key;
+        bool use_color = true;
+        bool use_dihedral = true;
+        TransportOptions transport;
+        std::unique_ptr<FileSource> file;
+        std::unique_ptr<EncodePipeline> encoder;
+        std::unique_ptr<DecodePipeline> decoder;
+        std::unique_ptr<FfmpegSink> sink;
+        ComPtr<ID3D11Texture2D> source_tex;
+        ComPtr<ID3D11ShaderResourceView> source_srv;
+        int src_w = 0;
+        int src_h = 0;
+        std::string message;
+        std::string error;
+        Clock::time_point started{};
     };
 
     HINSTANCE instance_ = nullptr;
@@ -267,6 +377,14 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     bool show_key_ = false;
     bool auto_match_settings_ = true;
     Clock::time_point key_copied_until_{};
+    GuiSettings settings_;
+    bool detached_preview_ = false;
+    std::unique_ptr<PreviewWindow> preview_window_;
+    ExportState export_;
+    std::wstring export_path_encode_;
+    std::wstring export_path_decode_;
+    int export_format_index_ = 0;
+    int export_bitrate_ = 8;
     EncodeState enc_;
     DecodeState dec_;
     std::vector<MonitorInfo> monitors_;
@@ -298,9 +416,15 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     bool auto_spout_ = false;
     bool auto_vcam_ = false;
     bool auto_record_ = false;
+    bool auto_detach_ = false;
+    bool auto_no_detach_ = false;
+    bool auto_export_ = false;
     std::wstring auto_file_;
     std::wstring auto_window_;
     std::wstring auto_out_;
+    std::wstring auto_format_ = L"mp4";
+    std::wstring auto_codec_ = L"h264";
+    int auto_export_bitrate_ = 0;
 
     int run();
     bool init(HINSTANCE instance);
@@ -308,6 +432,7 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void open_log();
     void log_line(const std::string& text);
     void set_error(const std::string& text);
+    void save_settings();
 
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     bool init_window(HINSTANCE instance);
@@ -329,6 +454,19 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void draw_decode_source();
     void draw_decode_preview();
     void draw_video_info();
+    void draw_player_bar(bool decode_mode);
+    void apply_player_seek(bool decode_mode, const cv::Mat& frame);
+    void handle_player_hotkeys();
+    void draw_preview_toolbar();
+    void set_detached_preview(bool detached);
+    void update_detached_preview();
+    bool start_export(bool for_decode);
+    void update_export();
+    void finish_export(bool cancelled);
+    void draw_export_ui(bool for_decode);
+    void probe_file(bool decode_mode, const std::wstring& path);
+    std::wstring default_export_path(bool for_decode, const std::wstring& source);
+    double export_source_duration_ms(bool for_decode) const;
     void draw_encode_actions();
     void draw_decode_actions();
     void draw_status_bar();
@@ -409,8 +547,11 @@ int GuiApp::Impl::run() {
             set_error(std::string("运行错误: ") + e.what());
             if (enc_.running) stop_encode();
             if (dec_.running) stop_decode();
+            if (export_.running) finish_export(true);
         }
         if (picker_open_) update_picker_preview();
+        if (export_.running) update_export();
+        update_detached_preview();
 
         if (!IsIconic(hwnd_) && win_w_ > 0 && win_h_ > 0) {
             ImGui_ImplDX11_NewFrame();
@@ -440,14 +581,28 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     instance_ = instance;
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     open_log();
+    load_gui_settings(&settings_);
+    export_bitrate_ = std::clamp(settings_.export_bitrate, 1, 100);
+    export_path_encode_ = settings_.export_path_encode;
+    export_path_decode_ = settings_.export_path_decode;
+    for (int i = 0; i < kExportFormatCount; ++i) {
+        if (settings_.export_format == kExportFormats[i].extension &&
+            settings_.export_codec == kExportFormats[i].codec) {
+            export_format_index_ = i;
+            break;
+        }
+    }
     monitors_ = enumerate_monitors();
     ui_key_cache_ = key_buf_;
     ui_key_id_ = key_id_for_text(ui_key_cache_);
     if (!init_window(instance)) return false;
     if (!init_d3d()) return false;
     if (!init_imgui()) return false;
-    log_line("GUI started");
     parse_command_line();
+    if (settings_.detached_preview || auto_detach_) {
+        if (!auto_no_detach_) set_detached_preview(true);
+    }
+    log_line("GUI started");
     apply_auto_start();
     return true;
 }
@@ -481,6 +636,23 @@ void GuiApp::Impl::parse_command_line() {
         } else if (arg == L"--no-color") {
             enc_use_color_ = false;
             dec_.use_color = false;
+        } else if (arg == L"--detach") {
+            auto_detach_ = true;
+        } else if (arg == L"--no-detach") {
+            auto_no_detach_ = true;
+        } else if (arg == L"--export") {
+            auto_export_ = true;
+            auto_start_ = true;
+        } else if (arg == L"--format" && i + 1 < argc) {
+            auto_format_ = argv[++i];
+        } else if (arg == L"--codec" && i + 1 < argc) {
+            auto_codec_ = argv[++i];
+        } else if (arg == L"--export-bitrate" && i + 1 < argc) {
+            try {
+                auto_export_bitrate_ = std::stoi(argv[++i]);
+            } catch (...) {
+                auto_export_bitrate_ = 0;
+            }
         } else if (arg == L"--auto") {
             auto_start_ = true;
         } else if (arg == L"--spout") {
@@ -507,6 +679,45 @@ void GuiApp::Impl::apply_auto_start() {
         }
     }
 
+    if (auto_export_) {
+        if (auto_file_.empty()) {
+            set_error("--export 需要 --file 指定源文件。");
+            return;
+        }
+        mode_ = auto_decode_ ? Mode::Decode : Mode::Encode;
+        if (auto_decode_) {
+            dec_.source = DecodeState::Source::File;
+            dec_.file_path = auto_file_;
+            dec_.detect_file = auto_detect_;
+            probe_file(true, auto_file_);
+        } else {
+            enc_.source = EncodeState::Source::File;
+            enc_.file_path = auto_file_;
+            probe_file(false, auto_file_);
+        }
+        const std::string format = lower_ascii(wide_to_utf8(auto_format_));
+        const std::string codec = lower_ascii(wide_to_utf8(auto_codec_));
+        for (int i = 0; i < kExportFormatCount; ++i) {
+            if (format == kExportFormats[i].extension &&
+                codec == kExportFormats[i].codec) {
+                export_format_index_ = i;
+                break;
+            }
+        }
+        if (auto_export_bitrate_ > 0) {
+            export_bitrate_ = std::clamp(auto_export_bitrate_, 1, 100);
+        }
+        if (!auto_out_.empty()) {
+            if (auto_decode_) {
+                export_path_decode_ = auto_out_;
+            } else {
+                export_path_encode_ = auto_out_;
+            }
+        }
+        start_export(auto_decode_);
+        return;
+    }
+
     if (auto_decode_) {
         mode_ = Mode::Decode;
         dec_.detect_file = auto_detect_;
@@ -518,6 +729,7 @@ void GuiApp::Impl::apply_auto_start() {
         } else {
             dec_.source = DecodeState::Source::File;
             dec_.file_path = auto_file_;
+            probe_file(true, auto_file_);
         }
         start_decode();
     } else {
@@ -533,6 +745,7 @@ void GuiApp::Impl::apply_auto_start() {
         } else {
             enc_.source = EncodeState::Source::File;
             enc_.file_path = auto_file_;
+            probe_file(false, auto_file_);
         }
         if (!auto_out_.empty()) {
             enc_.record_path = auto_out_;
@@ -543,10 +756,46 @@ void GuiApp::Impl::apply_auto_start() {
     }
 }
 
+void GuiApp::Impl::save_settings() {
+    if (hwnd_) {
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        if (GetWindowPlacement(hwnd_, &placement)) {
+            settings_.maximized = placement.showCmd == SW_SHOWMAXIMIZED;
+            const RECT& rect = placement.rcNormalPosition;
+            if (rect.right > rect.left && rect.bottom > rect.top) {
+                settings_.window_x = rect.left;
+                settings_.window_y = rect.top;
+                settings_.window_w = rect.right - rect.left;
+                settings_.window_h = rect.bottom - rect.top;
+            }
+        }
+    }
+    if (preview_window_) {
+        RECT rect{};
+        preview_window_->get_window_rect(&rect);
+        if (rect.right > rect.left && rect.bottom > rect.top) {
+            settings_.preview_x = rect.left;
+            settings_.preview_y = rect.top;
+            settings_.preview_w = rect.right - rect.left;
+            settings_.preview_h = rect.bottom - rect.top;
+        }
+        settings_.preview_topmost = preview_window_->topmost();
+    }
+    settings_.detached_preview = detached_preview_;
+    save_gui_settings(settings_);
+}
+
 void GuiApp::Impl::shutdown() {
+    finish_export(true);
+    save_settings();
     stop_encode();
     stop_decode();
     stop_picker_preview();
+    if (preview_window_) {
+        preview_window_->shutdown();
+        preview_window_.reset();
+    }
     if (ImGui::GetCurrentContext()) {
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
@@ -652,11 +901,29 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
         return false;
     }
 
-    RECT rc{0, 0, win_w_, win_h_};
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    RECT window_rect{};
+    bool have_saved_rect = settings_.window_w >= 1000 && settings_.window_h >= 680 &&
+                           settings_.window_x != INT_MIN &&
+                           settings_.window_y != INT_MIN;
+    if (have_saved_rect) {
+        window_rect = {settings_.window_x, settings_.window_y,
+                       settings_.window_x + settings_.window_w,
+                       settings_.window_y + settings_.window_h};
+        window_rect = clamp_window_rect(window_rect, 1000, 680);
+    } else {
+        window_rect = {0, 0, 1280, 820};
+        RECT adjusted = window_rect;
+        AdjustWindowRect(&adjusted, WS_OVERLAPPEDWINDOW, FALSE);
+        window_rect = {0, 0, adjusted.right - adjusted.left,
+                       adjusted.bottom - adjusted.top};
+    }
+
     hwnd_ = CreateWindowExW(0, L"OBScureGuiWindow", L"OBScure",
-                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                            rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr,
+                            WS_OVERLAPPEDWINDOW,
+                            have_saved_rect ? window_rect.left : CW_USEDEFAULT,
+                            have_saved_rect ? window_rect.top : CW_USEDEFAULT,
+                            window_rect.right - window_rect.left,
+                            window_rect.bottom - window_rect.top, nullptr, nullptr,
                             instance, this);
     if (!hwnd_) {
         set_error("无法创建主窗口");
@@ -669,17 +936,18 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
     SetWindowTextW(hwnd_, L"OBScure");
     PROCESS_DPI_AWARENESS awareness = PROCESS_DPI_UNAWARE;
     GetProcessDpiAwareness(nullptr, &awareness);
-    RECT window_rect{};
-    GetWindowRect(hwnd_, &window_rect);
+    RECT window_rect_log{};
+    GetWindowRect(hwnd_, &window_rect_log);
     log_line("window client " + std::to_string(win_w_) + "x" + std::to_string(win_h_) +
-             " rect " + std::to_string(window_rect.right - window_rect.left) + "x" +
-             std::to_string(window_rect.bottom - window_rect.top) + " dpi " +
+             " rect " + std::to_string(window_rect_log.right - window_rect_log.left) + "x" +
+             std::to_string(window_rect_log.bottom - window_rect_log.top) + " dpi " +
              std::to_string(GetDpiForWindow(hwnd_)) + " awareness " +
              std::to_string(static_cast<int>(awareness)) + " thread_awareness " +
              std::to_string(GetAwarenessFromDpiAwarenessContext(
                  GetThreadDpiAwarenessContext())));
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
+    if (settings_.maximized) ShowWindow(hwnd_, SW_MAXIMIZE);
     return true;
 }
 
@@ -899,10 +1167,35 @@ void GuiApp::Impl::draw() {
         ImGui::PopStyleColor();
     }
 
+    draw_preview_toolbar();
+
+    if (export_.running) {
+        ImGui::TextColored(kYellow, "导出中：%s %d/%d 帧",
+                           export_.for_decode ? "解码" : "编码",
+                           export_.done_frames, export_.total_frames);
+    }
+
+    if (detached_preview_ && preview_window_ && !io.WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_F8, false)) {
+        const bool topmost = !preview_window_->topmost();
+        preview_window_->set_topmost(topmost);
+        settings_.preview_topmost = topmost;
+        save_settings();
+    }
+    if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
+        set_detached_preview(!detached_preview_);
+    }
+    if (export_.running && !io.WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        export_.cancel_requested = true;
+    }
+
     if (mode_ == Mode::Decode && dec_.running && !ImGui::GetIO().WantTextInput &&
         ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
         request_video_settings();
     }
+
+    handle_player_hotkeys();
 
     if (mode_ == Mode::Encode) {
         draw_encode();
@@ -947,7 +1240,12 @@ void GuiApp::Impl::draw_header() {
 
 void GuiApp::Impl::draw_encode() {
     const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - 62.0f);
-    ImGui::BeginChild("##enc_left", ImVec2(370, content_h), ImGuiChildFlags_Borders);
+    const float left_w = detached_preview_
+                             ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
+                             : 370.0f;
+    ImGui::BeginChild("##enc_left", ImVec2(left_w, content_h),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
     draw_encode_source();
     ImGui::Separator();
     draw_encode_outputs();
@@ -957,15 +1255,19 @@ void GuiApp::Impl::draw_encode() {
     ImGui::BeginDisabled(enc_.running);
     ImGui::Checkbox("颜色混淆", &enc_use_color_);
     ImGui::EndDisabled();
-    ImGui::TextDisabled("关闭后保留原色；位置/翻转混淆仍启用。");
+    ImGui::TextWrapped("关闭后保留原色；位置/翻转混淆仍启用。");
     ImGui::Separator();
     draw_key();
+    draw_export_ui(false);
     ImGui::EndChild();
 
-    ImGui::SameLine();
-    ImGui::BeginChild("##enc_preview", ImVec2(0, content_h), ImGuiChildFlags_Borders);
-    draw_encode_preview();
-    ImGui::EndChild();
+    if (!detached_preview_) {
+        ImGui::SameLine();
+        ImGui::BeginChild("##enc_preview", ImVec2(0, content_h),
+                          ImGuiChildFlags_Borders);
+        draw_encode_preview();
+        ImGui::EndChild();
+    }
 
     draw_encode_actions();
 }
@@ -1021,6 +1323,7 @@ void GuiApp::Impl::draw_encode_source() {
                 enc_.file_path = path;
                 enc_.source_w = 0;
                 enc_.source_h = 0;
+                probe_file(false, path);
             }
         }
         if (!enc_.file_path.empty()) {
@@ -1030,7 +1333,8 @@ void GuiApp::Impl::draw_encode_source() {
         }
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("窗口捕获需要窗口可见；独占全屏游戏建议用无边框模式。");
+    ImGui::TextWrapped("窗口捕获需要窗口可见；独占全屏游戏建议用无边框模式。");
+    draw_player_bar(false);
 }
 
 void GuiApp::Impl::draw_encode_outputs() {
@@ -1045,10 +1349,11 @@ void GuiApp::Impl::draw_encode_outputs() {
             enc_.spout_name = name;
         }
     }
-    ImGui::Checkbox("虚拟摄像头（OBScure Virtual Camera）", &enc_.out_vcam);
-    ImGui::TextDisabled("独立 DirectShow 设备，输出 NV12（优先）/ YUY2 / RGB。");
-    ImGui::TextDisabled("OBS 里添加“视频采集设备”即可，不需要窗口采集。");
-    ImGui::Checkbox("录制到文件", &enc_.out_record);
+    ImGui::Checkbox("虚拟摄像头（OBScure）", &enc_.out_vcam);
+    ImGui::TextWrapped("DirectShow 虚拟摄像头");
+    ImGui::TextWrapped("优先 NV12，其次 YUY2 / RGB。");
+    ImGui::TextWrapped("OBS 添加“视频采集设备”即可。");
+    ImGui::Checkbox("实时录制（直播模拟）", &enc_.out_record);
     if (enc_.out_record) {
         if (enc_.record_path.empty()) enc_.record_path = make_record_path();
         ImGui::TextWrapped("%s", wide_to_utf8(enc_.record_path).c_str());
@@ -1061,7 +1366,7 @@ void GuiApp::Impl::draw_encode_outputs() {
         if (ImGui::InputInt("录制码率 (Mbps)", &record_bitrate_)) {
             record_bitrate_ = std::clamp(record_bitrate_, 2, 50);
         }
-        ImGui::TextDisabled("直播参考：1080p60 约 6–8 Mbps，720p60 约 4–6 Mbps。");
+        ImGui::TextWrapped("直播参考：1080p60 约 6–8 Mbps，720p60 约 4–6 Mbps。");
     }
     ImGui::EndDisabled();
 
@@ -1103,7 +1408,7 @@ void GuiApp::Impl::draw_presets() {
     const auto& p = kPresets[preset_index_];
     ImGui::TextDisabled("cell %d · guard %d · scale %.1fx", p.cell, p.guard, p.scale);
     ImGui::TextDisabled("建议码率 %d Mbps", p.bitrate);
-    ImGui::TextDisabled("本阶段固定算法，画质/码率后续再调。");
+    ImGui::TextWrapped("本阶段固定算法，画质/码率后续再调。");
 }
 
 void GuiApp::Impl::draw_key() {
@@ -1183,7 +1488,12 @@ void GuiApp::Impl::draw_encode_preview() {
     int width = 0;
     int height = 0;
     std::string label;
-    if (enc_.show_transport && enc_.encoder) {
+    if (export_.running && !export_.for_decode && export_.encoder) {
+        srv = export_.encoder->output_srv();
+        width = 1920;
+        height = 1080;
+        label = "导出预览 1920x1080";
+    } else if (enc_.show_transport && enc_.encoder) {
         srv = enc_.encoder->output_srv();
         width = 1920;
         height = 1080;
@@ -1248,16 +1558,17 @@ void GuiApp::Impl::draw_encode_actions() {
         ImGui::SameLine();
         if (ImGui::Button("显示输出窗口")) enc_.output_window->show();
     }
-    if (!enc_.error.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(kRed, "%s", enc_.error.c_str());
-    }
     ImGui::EndChild();
 }
 
 void GuiApp::Impl::draw_decode() {
     const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - 62.0f);
-    ImGui::BeginChild("##dec_left", ImVec2(370, content_h), ImGuiChildFlags_Borders);
+    const float left_w = detached_preview_
+                             ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
+                             : 370.0f;
+    ImGui::BeginChild("##dec_left", ImVec2(left_w, content_h),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
     draw_decode_source();
     ImGui::Separator();
     draw_presets();
@@ -1265,7 +1576,7 @@ void GuiApp::Impl::draw_decode() {
     ImGui::Checkbox("颜色还原", &dec_.use_color);
     ImGui::Checkbox("自动匹配视频设置", &auto_match_settings_);
     draw_video_info();
-    ImGui::TextDisabled("修改档位/密钥/颜色后，点“应用设置”立即生效。");
+    ImGui::TextWrapped("修改档位/密钥/颜色后，点“应用设置”立即生效。");
     ImGui::Separator();
     ImGui::TextDisabled("边缘内缩");
     const char* margin_items[] = {"自动", "0 px", "1 px", "2 px"};
@@ -1274,15 +1585,19 @@ void GuiApp::Impl::draw_decode() {
         margin_override_ = margin_index - 1;
         if (margin_override_ >= 0) dec_.margin = margin_override_;
     }
-    ImGui::TextDisabled("自动：大窗口内缩 1px，减少 cell 白边。");
+    ImGui::TextWrapped("自动：大窗口内缩 1px；c64 1:1 也会内缩，减少 cell 白边。");
     ImGui::Separator();
     draw_key();
+    draw_export_ui(true);
     ImGui::EndChild();
 
-    ImGui::SameLine();
-    ImGui::BeginChild("##dec_preview", ImVec2(0, content_h), ImGuiChildFlags_Borders);
-    draw_decode_preview();
-    ImGui::EndChild();
+    if (!detached_preview_) {
+        ImGui::SameLine();
+        ImGui::BeginChild("##dec_preview", ImVec2(0, content_h),
+                          ImGuiChildFlags_Borders);
+        draw_decode_preview();
+        ImGui::EndChild();
+    }
 
     draw_decode_actions();
 }
@@ -1301,7 +1616,10 @@ void GuiApp::Impl::draw_decode_source() {
     if (dec_.source == DecodeState::Source::File) {
         if (ImGui::Button("打开混淆视频...", ImVec2(-1, 0))) {
             const auto path = open_file_dialog(L"选择混淆视频", kVideoFilter);
-            if (!path.empty()) dec_.file_path = path;
+            if (!path.empty()) {
+                dec_.file_path = path;
+                probe_file(true, path);
+            }
         }
         if (!dec_.file_path.empty()) {
             ImGui::TextWrapped("%s", wide_to_utf8(dec_.file_path).c_str());
@@ -1309,7 +1627,7 @@ void GuiApp::Impl::draw_decode_source() {
             ImGui::TextDisabled("未选择文件");
         }
         ImGui::Checkbox("播放器录屏（启用定位）", &dec_.detect_file);
-        ImGui::TextDisabled("精确传输帧不勾选；播放器缩放/录屏时勾选。");
+        ImGui::TextWrapped("精确传输帧不勾选；播放器缩放/录屏时勾选。");
     } else if (dec_.source == DecodeState::Source::Window) {
         if (ImGui::Button("选择窗口...", ImVec2(-1, 0))) open_picker(true);
         if (dec_.hwnd && IsWindow(dec_.hwnd)) {
@@ -1341,8 +1659,9 @@ void GuiApp::Impl::draw_decode_source() {
         }
     }
     ImGui::Checkbox("独立预览窗口", &dec_.fullscreen);
-    ImGui::TextDisabled("文件模式默认按精确传输帧解码；窗口/显示器会自动定位。");
+    ImGui::TextWrapped("文件模式默认按精确传输帧解码；窗口/显示器会自动定位。");
     ImGui::EndDisabled();
+    draw_player_bar(true);
 }
 
 void GuiApp::Impl::draw_decode_preview() {
@@ -1353,7 +1672,14 @@ void GuiApp::Impl::draw_decode_preview() {
     int width = 0;
     int height = 0;
     std::string label;
-    if (dec_.show_capture && dec_.source_srv) {
+    if (export_.running && export_.for_decode && export_.decoder) {
+        srv = export_.decoder->restored_srv();
+        width = export_.width;
+        height = export_.height;
+        char label_buf[64]{};
+        sprintf_s(label_buf, "导出预览 %dx%d", width, height);
+        label = label_buf;
+    } else if (dec_.show_capture && dec_.source_srv) {
         srv = dec_.source_srv.Get();
         width = dec_.source_w;
         height = dec_.source_h;
@@ -1381,18 +1707,780 @@ void GuiApp::Impl::draw_decode_preview() {
     ImGui::TextDisabled("四角 %d/4", dec_.markers);
     ImGui::SameLine();
     ImGui::TextColored(dec_.key_ok ? kGreen : kRed, "key %s", dec_.key_ok ? "✓" : "✗");
-    ImGui::SameLine();
     ImGui::TextDisabled("margin %d · 检测 %.0f ms", dec_.margin, dec_.detect_ms);
     if (dec_.source_w > 0) {
         ImGui::TextDisabled("捕获 %dx%d · 解码 %.1f fps", dec_.source_w, dec_.source_h,
                             dec_.fps);
         if (dec_.source == DecodeState::Source::File && dec_.running) {
-            ImGui::SameLine();
             ImGui::TextDisabled("源 %.1f fps · 丢帧 %llu", dec_.file.fps(),
                                 static_cast<unsigned long long>(dec_.file.dropped()));
         }
     }
-    if (!dec_.error.empty()) ImGui::TextColored(kRed, "%s", dec_.error.c_str());
+    if (!dec_.error.empty()) {
+        ImGui::TextWrapped("%s", dec_.error.c_str());
+    }
+}
+
+void GuiApp::Impl::draw_preview_toolbar() {
+    if (!detached_preview_) {
+        if (ImGui::Button("分离播放画面", ImVec2(140, 28))) {
+            set_detached_preview(true);
+        }
+        ImGui::SameLine();
+        ImGui::TextWrapped("把播放画面放到独立窗口，控制台与画面可分别缩放。");
+        return;
+    }
+
+    if (ImGui::Button("合并窗口", ImVec2(100, 28))) {
+        set_detached_preview(false);
+    }
+    ImGui::SameLine();
+    bool topmost = preview_window_ && preview_window_->topmost();
+    if (ImGui::Checkbox("始终置顶 (F8)", &topmost)) {
+        if (preview_window_) preview_window_->set_topmost(topmost);
+        settings_.preview_topmost = topmost;
+        save_settings();
+    }
+    if (preview_window_ && !preview_window_->visible()) {
+        ImGui::SameLine();
+        if (ImGui::Button("显示播放窗口", ImVec2(120, 28))) {
+            preview_window_->show();
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("播放画面已分离");
+}
+
+void GuiApp::Impl::set_detached_preview(bool detached) {
+    if (detached == detached_preview_) return;
+    if (!detached) {
+        if (preview_window_) preview_window_->hide();
+        detached_preview_ = false;
+        settings_.detached_preview = false;
+        save_settings();
+        return;
+    }
+
+    if (!preview_window_) {
+        RECT rect{};
+        bool have_rect = settings_.preview_w >= 320 && settings_.preview_h >= 180 &&
+                         settings_.preview_x != INT_MIN &&
+                         settings_.preview_y != INT_MIN;
+        if (have_rect) {
+            rect = {settings_.preview_x, settings_.preview_y,
+                    settings_.preview_x + settings_.preview_w,
+                    settings_.preview_y + settings_.preview_h};
+            rect = clamp_window_rect(rect, 320, 180);
+        } else {
+            RECT main_rect{};
+            GetWindowRect(hwnd_, &main_rect);
+            rect = {main_rect.right + 16, main_rect.top,
+                    main_rect.right + 16 + 960, main_rect.top + 540};
+            rect = clamp_window_rect(rect, 320, 180);
+        }
+
+        auto window = std::make_unique<PreviewWindow>();
+        std::string error;
+        if (!window->init(device_.Get(), context_.Get(), rect, L"OBScure 播放画面",
+                          resolve_shader_path(L"blit.hlsl"), &error)) {
+            set_error("创建播放窗口失败: " + error);
+            return;
+        }
+        preview_window_ = std::move(window);
+    }
+
+    preview_window_->set_topmost(settings_.preview_topmost);
+    preview_window_->show();
+    detached_preview_ = true;
+    settings_.detached_preview = true;
+    save_settings();
+}
+
+void GuiApp::Impl::update_detached_preview() {
+    if (!detached_preview_ || !preview_window_) return;
+
+    if (export_.running) {
+        ID3D11ShaderResourceView* srv = nullptr;
+        int width = 0;
+        int height = 0;
+        if (export_.encoder) {
+            srv = export_.encoder->output_srv();
+            width = 1920;
+            height = 1080;
+        } else if (export_.decoder) {
+            srv = export_.decoder->restored_srv();
+            width = export_.width;
+            height = export_.height;
+        }
+        preview_window_->set_title(L"OBScure 播放画面 - 导出");
+        preview_window_->present(srv, width, height);
+        return;
+    }
+
+    ID3D11ShaderResourceView* srv = nullptr;
+    int width = 0;
+    int height = 0;
+    if (mode_ == Mode::Encode) {
+        preview_window_->set_title(L"OBScure 播放画面 - 编码");
+        if (enc_.show_transport && enc_.encoder) {
+            srv = enc_.encoder->output_srv();
+            width = 1920;
+            height = 1080;
+        } else if (enc_.source_srv) {
+            srv = enc_.source_srv.Get();
+            width = enc_.source_w;
+            height = enc_.source_h;
+        }
+    } else {
+        preview_window_->set_title(L"OBScure 播放画面 - 解码");
+        if (dec_.show_capture && dec_.source_srv) {
+            srv = dec_.source_srv.Get();
+            width = dec_.source_w;
+            height = dec_.source_h;
+        } else if (dec_.decoder) {
+            srv = dec_.decoder->restored_srv();
+            width = dec_.decoder->layout().ref_w();
+            height = dec_.decoder->layout().ref_h();
+        }
+    }
+    preview_window_->present(srv, width, height);
+}
+
+void GuiApp::Impl::probe_file(bool decode_mode, const std::wstring& path) {
+    if (!export_.running) {
+        export_.message.clear();
+        export_.error.clear();
+    }
+    double duration_ms = 0.0;
+    double fps = 60.0;
+    int frames = 0;
+    bool valid = false;
+    if (!path.empty()) {
+        FileSource probe;
+        std::string error;
+        if (probe.open(path, &error)) {
+            duration_ms = probe.duration_ms();
+            fps = probe.fps();
+            frames = probe.total_frames();
+            valid = true;
+            probe.close();
+        }
+    }
+    if (decode_mode) {
+        dec_.probe_duration_ms = duration_ms;
+        dec_.probe_fps = fps;
+        dec_.probe_frames = frames;
+        dec_.probe_valid = valid;
+    } else {
+        enc_.probe_duration_ms = duration_ms;
+        enc_.probe_fps = fps;
+        enc_.probe_frames = frames;
+        enc_.probe_valid = valid;
+    }
+    std::wstring& output = decode_mode ? export_path_decode_ : export_path_encode_;
+    std::wstring& known_source =
+        decode_mode ? settings_.export_source_decode : settings_.export_source_encode;
+    if (output.empty() || path != known_source) {
+        output = default_export_path(decode_mode, path);
+        known_source = path;
+        if (decode_mode) {
+            settings_.export_path_decode = output;
+        } else {
+            settings_.export_path_encode = output;
+        }
+        save_settings();
+    }
+}
+
+std::wstring GuiApp::Impl::default_export_path(bool for_decode,
+                                              const std::wstring& source_path) {
+    namespace fs = std::filesystem;
+    if (source_path.empty()) return {};
+    fs::path source(source_path);
+    fs::path dir = settings_.export_dir.empty() ? source.parent_path()
+                                                : fs::path(settings_.export_dir);
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) dir = source.parent_path();
+    std::wstring stem = source.stem().wstring();
+    stem += for_decode ? L"_restored" : L"_obscured";
+    const std::string extension =
+        kExportFormats[std::clamp(export_format_index_, 0, kExportFormatCount - 1)]
+            .extension;
+    return (dir / (stem + L"." + utf8_to_wide(extension))).wstring();
+}
+
+double GuiApp::Impl::export_source_duration_ms(bool for_decode) const {
+    if (for_decode) {
+        if (dec_.file.is_open()) return dec_.file.duration_ms();
+        return dec_.probe_duration_ms;
+    }
+    if (enc_.file.is_open()) return enc_.file.duration_ms();
+    return enc_.probe_duration_ms;
+}
+
+bool GuiApp::Impl::start_export(bool for_decode) {
+    if (export_.running) return false;
+    if (enc_.running || dec_.running) {
+        set_error("请先停止实时编码/解码，再开始导出。");
+        return false;
+    }
+
+    const std::wstring& source_path =
+        for_decode ? dec_.file_path : enc_.file_path;
+    std::wstring& output_path =
+        for_decode ? export_path_decode_ : export_path_encode_;
+    if (source_path.empty()) {
+        set_error("请先选择源文件。");
+        return false;
+    }
+    if (output_path.empty()) {
+        output_path = default_export_path(for_decode, source_path);
+    }
+    const int format_index =
+        std::clamp(export_format_index_, 0, kExportFormatCount - 1);
+    output_path = replace_extension(output_path,
+                                    kExportFormats[format_index].extension);
+
+    ExportState state;
+    state.for_decode = for_decode;
+    state.source_path = source_path;
+    state.output_path = output_path;
+    state.format = kExportFormats[format_index].extension;
+    state.codec = kExportFormats[format_index].codec;
+    state.bitrate = std::clamp(export_bitrate_, 1, 100);
+
+    std::string error;
+    state.file = std::make_unique<FileSource>();
+    if (!state.file->open(source_path, &error)) {
+        set_error("打开导出源失败: " + error);
+        return false;
+    }
+    state.file->set_loop(false);
+    state.fps = std::clamp(state.file->fps(), 1.0, 240.0);
+    state.total_frames = state.file->total_frames();
+    if (state.total_frames <= 0 && state.file->duration_ms() > 0.0) {
+        state.total_frames = static_cast<int>(
+            std::lround(state.file->duration_ms() / 1000.0 * state.fps));
+    }
+
+    if (!for_decode) {
+        const Preset& preset = kPresets[preset_index_];
+        Layout layout;
+        layout.cell = preset.cell;
+        layout.guard = preset.guard;
+        if (!public_mode_ && key_buf_[0] == '\0') {
+            set_error("密钥不能为空。");
+            return false;
+        }
+        layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
+        layout.validate();
+        const KeyMaterial key = derive_key(layout);
+        state.layout = layout;
+        state.key = key;
+        state.use_color = enc_use_color_;
+        state.use_dihedral = true;
+        state.transport.use_color = enc_use_color_;
+        state.transport.use_dihedral = true;
+        state.transport.public_mode = public_mode_;
+        state.transport.preset_id = preset_index_ + 1;
+        state.transport.scale_x10 = preset_scale_x10(preset);
+        state.encoder = std::make_unique<EncodePipeline>();
+        if (!state.encoder->init(device_.Get(), context_.Get(), layout, key,
+                                 preset.scale, state.transport,
+                                 resolve_shader_path(L"transport.hlsl"), &error)) {
+            set_error("导出编码器初始化失败: " + error);
+            return false;
+        }
+        state.width = 1920;
+        state.height = 1080;
+    } else {
+        cv::Mat first;
+        if (!state.file->read_sequential(first) || first.empty()) {
+            set_error("读取导出源第一帧失败。");
+            return false;
+        }
+        state.first_frame = first;
+        state.pending_first_frame = true;
+
+        Layout layout;
+        layout.cell = kPresets[preset_index_].cell;
+        layout.guard = kPresets[preset_index_].guard;
+        layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
+        layout.validate();
+        KeyMaterial key = derive_key(layout);
+        bool use_color = dec_.use_color;
+        bool use_dihedral = dec_.use_dihedral;
+        std::optional<Metadata> applied_meta;
+
+        const cv::Mat identity = identity_scaled(first.cols, first.rows);
+        auto metadata = decode_metadata(first, identity, layout);
+        auto apply_metadata = [&](const Metadata& md, bool& ok, std::string& why) {
+            auto target = layout_from_metadata(md);
+            if (!target) {
+                why = "视频元数据几何参数非法。";
+                ok = false;
+                return;
+            }
+            layout = *target;
+            applied_meta = md;
+            if (md.public_mode()) {
+                public_mode_ = true;
+                layout.key = kPublicKey;
+            } else {
+                public_mode_ = false;
+                layout.key = key_buf_;
+            }
+            key = derive_key(layout);
+            use_color = md.use_color();
+            use_dihedral = md.use_dihedral();
+            if (const auto* p = preset_by_id(md.preset_id)) {
+                const int idx = preset_index_by_id(p->id);
+                if (idx >= 0) preset_index_ = idx;
+            } else {
+                const int idx = preset_index_by_geometry(md.cell, md.guard, md.scale_x10);
+                if (idx >= 0) preset_index_ = idx;
+            }
+            if (!md.public_mode() && md.key_id != key.key_id) {
+                char buffer[160]{};
+                sprintf_s(buffer, "密钥不匹配：视频 keyID %08X，当前 keyID %08X",
+                          md.key_id, key.key_id);
+                why = buffer;
+                ok = false;
+            }
+        };
+
+        bool metadata_ok = metadata.has_value();
+        if (metadata_ok) {
+            bool ok = true;
+            std::string why;
+            apply_metadata(*metadata, ok, why);
+            if (!ok) {
+                set_error(why);
+                return false;
+            }
+        }
+
+        cv::Mat H;
+        bool detection_mode = dec_.detect_file;
+        if (detection_mode) {
+            DetectionOutcome outcome;
+            DetectionWorker::detect(first, layout, key, &outcome);
+            if (!outcome.ok) {
+                set_error("无法定位四角标记，不能导出。");
+                return false;
+            }
+            H = outcome.H;
+            if (!metadata_ok && outcome.metadata) {
+                bool ok = true;
+                std::string why;
+                apply_metadata(*outcome.metadata, ok, why);
+                if (!ok) {
+                    set_error(why);
+                    return false;
+                }
+                metadata_ok = true;
+            }
+        } else {
+            H = identity;
+            if (!metadata_ok) {
+                DetectionOutcome outcome;
+                DetectionWorker::detect(first, layout, key, &outcome);
+                if (outcome.ok) {
+                    detection_mode = true;
+                    H = outcome.H;
+                    if (outcome.metadata) {
+                        bool ok = true;
+                        std::string why;
+                        apply_metadata(*outcome.metadata, ok, why);
+                        if (!ok) {
+                            set_error(why);
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        if (H.empty()) {
+            set_error("无法确定导出画面的定位。");
+            return false;
+        }
+
+        state.layout = layout;
+        state.key = key;
+        state.use_color = use_color;
+        state.use_dihedral = use_dihedral;
+        dec_.use_color = use_color;
+        dec_.use_dihedral = use_dihedral;
+        if (applied_meta) dec_.video_meta = *applied_meta;
+        state.H = H;
+        state.detection_mode = detection_mode;
+        state.decoder = std::make_unique<DecodePipeline>();
+        if (!state.decoder->init(device_.Get(), context_.Get(), layout, key, use_color,
+                                 use_dihedral, resolve_shader_path(L"decode.hlsl"),
+                                 &error)) {
+            set_error("导出解码器初始化失败: " + error);
+            return false;
+        }
+        state.width = layout.ref_w();
+        state.height = layout.ref_h();
+    }
+
+    state.sink = std::make_unique<FfmpegSink>();
+    const VideoCodec codec =
+        state.codec == "h265" ? VideoCodec::H265 : VideoCodec::H264;
+    if (!state.sink->start(device_.Get(), context_.Get(), state.width, state.height,
+                           state.fps, state.bitrate, state.output_path, &error,
+                           codec)) {
+        set_error("启动导出编码失败: " + error);
+        return false;
+    }
+
+    state.started = Clock::now();
+    export_ = std::move(state);
+    export_.running = true;
+
+    settings_.export_dir = std::filesystem::path(output_path).parent_path().wstring();
+    settings_.export_format = export_.format;
+    settings_.export_codec = export_.codec;
+    settings_.export_bitrate = export_bitrate_;
+    if (for_decode) {
+        settings_.export_path_decode = output_path;
+        settings_.export_source_decode = source_path;
+    } else {
+        settings_.export_path_encode = output_path;
+        settings_.export_source_encode = source_path;
+    }
+    save_settings();
+    log_line(std::string("export started: ") + (for_decode ? "decode" : "encode") +
+             " format=" + export_.format + " codec=" + export_.codec +
+             " bitrate=" + std::to_string(export_.bitrate));
+    return true;
+}
+
+void GuiApp::Impl::update_export() {
+    if (!export_.running) return;
+    if (export_.sink && !export_.sink->error().empty()) {
+        export_.error = export_.sink->error();
+        finish_export(false);
+        return;
+    }
+    if (export_.cancel_requested) {
+        finish_export(true);
+        return;
+    }
+
+    const auto deadline = Clock::now() + std::chrono::milliseconds(8);
+    int processed = 0;
+    while (processed < 2 && Clock::now() < deadline && export_.running) {
+        cv::Mat frame;
+        if (export_.pending_first_frame) {
+            frame = export_.first_frame;
+            export_.pending_first_frame = false;
+        } else if (!export_.file->read_sequential(frame) || frame.empty()) {
+            finish_export(false);
+            return;
+        }
+
+        if (export_.encoder) {
+            upload_bgr(frame, export_.source_tex, export_.source_srv, export_.src_w,
+                       export_.src_h);
+            export_.encoder->render(export_.source_srv.Get());
+            export_.sink->write(export_.encoder->output_texture());
+        } else if (export_.decoder) {
+            if (export_.detection_mode && !export_.H.empty() &&
+                export_.done_frames > 0 && export_.done_frames % 120 == 0) {
+                DetectionOutcome outcome;
+                DetectionWorker::detect(frame, export_.layout, export_.key, &outcome);
+                if (outcome.ok) {
+                    export_.H = outcome.H;
+                    export_.detect_failures = 0;
+                } else {
+                    ++export_.detect_failures;
+                }
+            }
+            if (export_.H.empty()) {
+                export_.error = "导出时无法定位四角标记。";
+                finish_export(false);
+                return;
+            }
+            const cv::Mat H = export_.detection_mode
+                                  ? export_.H
+                                  : identity_scaled(frame.cols, frame.rows);
+            upload_bgr(frame, export_.source_tex, export_.source_srv, export_.src_w,
+                       export_.src_h);
+            export_.decoder->render(export_.source_srv.Get(), frame.cols, frame.rows,
+                                    H);
+            export_.sink->write(export_.decoder->restored_texture());
+        } else {
+            export_.error = "导出管线未初始化。";
+            finish_export(false);
+            return;
+        }
+
+        ++export_.done_frames;
+        ++processed;
+        if (export_.total_frames > 0 &&
+            export_.done_frames >= export_.total_frames) {
+            finish_export(false);
+            return;
+        }
+        if (export_.sink && !export_.sink->error().empty()) {
+            export_.error = export_.sink->error();
+            finish_export(false);
+            return;
+        }
+    }
+}
+
+void GuiApp::Impl::finish_export(bool cancelled) {
+    if (!export_.running && !export_.sink) return;
+    if (export_.sink) {
+        export_.sink->stop();
+        if (!export_.sink->error().empty()) export_.error = export_.sink->error();
+        export_.sink.reset();
+    }
+    export_.encoder.reset();
+    export_.decoder.reset();
+    if (export_.file) {
+        export_.file->close();
+        export_.file.reset();
+    }
+    export_.running = false;
+    export_.pending_first_frame = false;
+    const std::string mode = export_.for_decode ? "解码" : "编码";
+    if (cancelled) {
+        export_.message = mode + "导出已取消";
+    } else if (!export_.error.empty()) {
+        export_.message = mode + "导出失败";
+    } else {
+        export_.message = mode + "导出完成";
+    }
+    save_settings();
+    log_line(std::string("export finished: ") + export_.message +
+             " frames=" + std::to_string(export_.done_frames));
+}
+
+void GuiApp::Impl::draw_export_ui(bool for_decode) {
+    if (for_decode) {
+        if (dec_.source != DecodeState::Source::File || dec_.file_path.empty()) return;
+    } else {
+        if (enc_.source != EncodeState::Source::File || enc_.file_path.empty()) return;
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("导出视频（整段离线）");
+    if (export_.running) {
+        const float progress =
+            export_.total_frames > 0
+                ? std::clamp(static_cast<float>(export_.done_frames) /
+                                 export_.total_frames,
+                             0.0f, 1.0f)
+                : 0.0f;
+        char text[96]{};
+        if (export_.total_frames > 0) {
+            sprintf_s(text, "%d / %d 帧", export_.done_frames, export_.total_frames);
+        } else {
+            sprintf_s(text, "%d 帧", export_.done_frames);
+        }
+        ImGui::ProgressBar(progress, ImVec2(-1, 0), text);
+        ImGui::TextDisabled("%s导出中 · %.1f 秒", export_.for_decode ? "解码" : "编码",
+                            std::chrono::duration<double>(Clock::now() -
+                                                          export_.started)
+                                .count());
+        if (ImGui::Button("取消导出", ImVec2(110, 30))) {
+            export_.cancel_requested = true;
+        }
+        if (!export_.error.empty()) {
+            ImGui::TextWrapped("%s", export_.error.c_str());
+        }
+        return;
+    }
+
+    static const char* labels[] = {
+        "MP4 / H.264", "MKV / H.264", "MOV / H.264",
+        "MP4 / H.265", "MKV / H.265", "MOV / H.265",
+    };
+    int format_index = std::clamp(export_format_index_, 0, kExportFormatCount - 1);
+    ImGui::SetNextItemWidth(180);
+    if (ImGui::Combo("格式##export", &format_index, labels, kExportFormatCount)) {
+        export_format_index_ = format_index;
+        std::wstring& path = for_decode ? export_path_decode_ : export_path_encode_;
+        if (!path.empty()) {
+            path = replace_extension(path, kExportFormats[format_index].extension);
+        }
+        settings_.export_format = kExportFormats[format_index].extension;
+        settings_.export_codec = kExportFormats[format_index].codec;
+        save_settings();
+    }
+    ImGui::SetNextItemWidth(100);
+    if (ImGui::InputInt("码率 (Mbps)##export", &export_bitrate_)) {
+        export_bitrate_ = std::clamp(export_bitrate_, 1, 100);
+        settings_.export_bitrate = export_bitrate_;
+    }
+
+    const double duration_ms = export_source_duration_ms(for_decode);
+    if (duration_ms > 0.0) {
+        const double size_mb =
+            export_bitrate_ * (duration_ms / 1000.0) / 8.0 * 1.01;
+        ImGui::TextWrapped("预计文件大小：约 %.1f MB（%s @ %d Mbps）", size_mb,
+                           format_time_ms(duration_ms).c_str(), export_bitrate_);
+    } else {
+        ImGui::TextWrapped("无法读取时长，预计大小不可用。");
+    }
+
+    std::wstring& path = for_decode ? export_path_decode_ : export_path_encode_;
+    if (path.empty()) {
+        path = default_export_path(for_decode, for_decode ? dec_.file_path : enc_.file_path);
+    }
+    ImGui::TextWrapped("%s", wide_to_utf8(path).c_str());
+    if (ImGui::Button("选择导出路径...", ImVec2(-1, 0))) {
+        const std::wstring default_name =
+            std::filesystem::path(path).filename().wstring();
+        const auto selected =
+            save_file_dialog(L"导出视频", kVideoFilter, default_name);
+        if (!selected.empty()) {
+            path = replace_extension(selected,
+                                     kExportFormats[export_format_index_].extension);
+            settings_.export_dir =
+                std::filesystem::path(path).parent_path().wstring();
+            if (for_decode) {
+                settings_.export_path_decode = path;
+                settings_.export_source_decode = dec_.file_path;
+            } else {
+                settings_.export_path_encode = path;
+                settings_.export_source_encode = enc_.file_path;
+            }
+            save_settings();
+        }
+    }
+
+    const bool busy = enc_.running || dec_.running || export_.running;
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button(for_decode ? "开始解码导出" : "开始混淆导出", ImVec2(-1, 32))) {
+        start_export(for_decode);
+    }
+    ImGui::EndDisabled();
+    if (enc_.running || dec_.running) {
+        ImGui::TextWrapped("先停止实时运行，再开始导出。");
+    }
+    if (!export_.message.empty()) {
+        ImGui::TextWrapped("%s", export_.message.c_str());
+    }
+    if (!export_.error.empty()) {
+        ImGui::TextWrapped("%s", export_.error.c_str());
+    }
+}
+
+
+void GuiApp::Impl::handle_player_hotkeys() {
+    if (ImGui::GetIO().WantTextInput || ImGui::IsAnyItemActive()) return;
+    FileSource* file = nullptr;
+    bool decode_mode = false;
+    if (mode_ == Mode::Encode && enc_.source == EncodeState::Source::File &&
+        enc_.file.is_open()) {
+        file = &enc_.file;
+    } else if (mode_ == Mode::Decode && dec_.source == DecodeState::Source::File &&
+               dec_.file.is_open()) {
+        file = &dec_.file;
+        decode_mode = true;
+    }
+    if (!file) return;
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        file->set_paused(!file->paused());
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) {
+        const double delta = ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) ? -5000.0
+                                                                           : 5000.0;
+        cv::Mat frame;
+        if (file->seek_ms(file->position_ms() + delta, frame)) {
+            apply_player_seek(decode_mode, frame);
+        }
+    }
+}
+
+void GuiApp::Impl::draw_player_bar(bool decode_mode) {
+    FileSource& file = decode_mode ? dec_.file : enc_.file;
+    bool& dragging = decode_mode ? dec_.player_dragging : enc_.player_dragging;
+    float& player_pos = decode_mode ? dec_.player_pos : enc_.player_pos;
+    Clock::time_point& last_seek =
+        decode_mode ? dec_.player_last_seek : enc_.player_last_seek;
+
+    if (!file.is_open()) return;
+
+    ImGui::Separator();
+    ImGui::TextDisabled("播放控制");
+    const bool paused = file.paused();
+    if (ImGui::Button(paused ? "播放" : "暂停", ImVec2(64, 0))) {
+        file.set_paused(!paused);
+    }
+    ImGui::SameLine();
+    const std::string position = format_time_ms(file.position_ms());
+    const std::string duration = file.duration_ms() > 0
+                                     ? format_time_ms(file.duration_ms())
+                                     : "--:--";
+    ImGui::Text("%s / %s", position.c_str(), duration.c_str());
+    ImGui::SameLine();
+    bool loop = file.loop();
+    if (ImGui::Checkbox("循环", &loop)) {
+        file.set_loop(loop);
+        settings_.player_loop = loop;
+    }
+
+    const float duration_s =
+        file.duration_ms() > 0 ? static_cast<float>(file.duration_ms() / 1000.0) : 0.0f;
+    if (duration_s <= 0.0f) {
+        ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "时长未知");
+        return;
+    }
+
+    if (!dragging) player_pos = static_cast<float>(file.position_ms() / 1000.0);
+    ImGui::SetNextItemWidth(-1);
+    const bool changed =
+        ImGui::SliderFloat("##player_seek", &player_pos, 0.0f, duration_s, "%.1f s");
+    const bool active = ImGui::IsItemActive();
+    if (active) dragging = true;
+    const auto now = Clock::now();
+    const bool due = last_seek.time_since_epoch().count() == 0 ||
+                     now - last_seek >= std::chrono::milliseconds(120);
+
+    auto seek_now = [&] {
+        cv::Mat frame;
+        if (file.seek_ms(static_cast<double>(player_pos) * 1000.0, frame)) {
+            apply_player_seek(decode_mode, frame);
+        }
+        last_seek = now;
+    };
+    if (changed && due) seek_now();
+    if (!active && dragging) {
+        dragging = false;
+        seek_now();
+    }
+}
+
+void GuiApp::Impl::apply_player_seek(bool decode_mode, const cv::Mat& frame) {
+    if (frame.empty()) return;
+    if (decode_mode) {
+        const bool size_changed =
+            dec_.source_w != frame.cols || dec_.source_h != frame.rows;
+        dec_.last_file_frame = frame;
+        upload_bgr(frame, dec_.source_tex, dec_.source_srv, dec_.tex_w, dec_.tex_h);
+        dec_.tex_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        dec_.source_w = frame.cols;
+        dec_.source_h = frame.rows;
+        if (size_changed) {
+            dec_.H_initial = identity_scaled(frame.cols, frame.rows);
+            dec_.H = dec_.H_initial.clone();
+            if (dec_.detect_file) reset_decode_detection();
+        }
+    } else {
+        enc_.last_file_frame = frame;
+        upload_bgr(frame, enc_.source_tex, enc_.source_srv, enc_.tex_w, enc_.tex_h);
+        enc_.tex_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        enc_.source_w = frame.cols;
+        enc_.source_h = frame.rows;
+    }
 }
 
 void GuiApp::Impl::draw_video_info() {
@@ -1458,16 +2546,12 @@ void GuiApp::Impl::draw_decode_actions() {
         ImGui::SameLine();
         if (ImGui::Button("显示预览窗口")) dec_.fullscreen_window->show();
     }
-    if (!dec_.error.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(kRed, "%s", dec_.error.c_str());
-    }
     ImGui::EndChild();
 }
 
 void GuiApp::Impl::draw_status_bar() {
     ImGui::Separator();
-    ImGui::TextDisabled("OBScure v0.2 · 本阶段：GUI/窗口捕获/输出通路 · 画质与码率后续");
+    ImGui::TextDisabled("OBScure v0.3 · 分离窗口 / 文件播放 / 离线导出");
     ImGui::SameLine(ImGui::GetWindowWidth() - 290);
     ImGui::TextDisabled("编码 %.1f fps · 解码 %.1f fps",
                         enc_.running ? enc_.fps : 0.0,
@@ -1589,6 +2673,7 @@ void GuiApp::Impl::draw_picker() {
                 start_picker_preview(i);
             }
         }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", label.c_str());
         ImGui::PopID();
     }
     if (picker_windows_.empty()) {
@@ -1599,7 +2684,7 @@ void GuiApp::Impl::draw_picker() {
     ImGui::SameLine();
     ImGui::BeginChild("##win_preview", ImVec2(0, child_height), ImGuiChildFlags_Borders);
     if (!picker_error_.empty()) {
-        ImGui::TextColored(kRed, "%s", picker_error_.c_str());
+        ImGui::TextWrapped("%s", picker_error_.c_str());
     }
     if (picker_srv_) {
         draw_image_fit(picker_srv_.Get(), picker_tex_w_, picker_tex_h_, "窗口实时预览");
@@ -1677,6 +2762,10 @@ std::wstring GuiApp::Impl::make_record_path() {
 
 bool GuiApp::Impl::start_encode() {
     if (enc_.running) return true;
+    if (export_.running) {
+        set_error("导出中，请先等待或取消导出。");
+        return false;
+    }
     last_error_.clear();
     enc_.error.clear();
     try {
@@ -1717,6 +2806,11 @@ bool GuiApp::Impl::start_encode() {
             if (!enc_.file.open(enc_.file_path, &error)) {
                 return fail("打开视频失败: " + error);
             }
+            enc_.file.set_loop(settings_.player_loop);
+            enc_.probe_duration_ms = enc_.file.duration_ms();
+            enc_.probe_fps = enc_.file.fps();
+            enc_.probe_frames = enc_.file.total_frames();
+            enc_.probe_valid = true;
             cv::Mat first;
             if (!enc_.file.tick(first, true)) return fail("读取视频帧失败。");
             enc_.last_file_frame = first;
@@ -1929,6 +3023,10 @@ void GuiApp::Impl::update_encode() {
 
 bool GuiApp::Impl::start_decode() {
     if (dec_.running) return true;
+    if (export_.running) {
+        set_error("导出中，请先等待或取消导出。");
+        return false;
+    }
     last_error_.clear();
     dec_.error.clear();
     dec_.video_meta.reset();
@@ -1970,6 +3068,11 @@ bool GuiApp::Impl::start_decode() {
             if (!dec_.file.open(dec_.file_path, &error)) {
                 return fail("打开混淆视频失败: " + error);
             }
+            dec_.file.set_loop(settings_.player_loop);
+            dec_.probe_duration_ms = dec_.file.duration_ms();
+            dec_.probe_fps = dec_.file.fps();
+            dec_.probe_frames = dec_.file.total_frames();
+            dec_.probe_valid = true;
             cv::Mat first;
             if (!dec_.file.tick(first, true)) return fail("读取混淆视频帧失败。");
             dec_.last_file_frame = first;
