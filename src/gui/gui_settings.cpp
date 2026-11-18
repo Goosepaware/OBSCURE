@@ -74,6 +74,10 @@ bool load_gui_settings(GuiSettings* settings) {
     settings->window_w = parse_int(values, "window_w", settings->window_w);
     settings->window_h = parse_int(values, "window_h", settings->window_h);
     settings->maximized = parse_bool(values, "maximized", settings->maximized);
+    settings->console_x = parse_int(values, "console_x", settings->console_x);
+    settings->console_y = parse_int(values, "console_y", settings->console_y);
+    settings->console_w = parse_int(values, "console_w", settings->console_w);
+    settings->console_h = parse_int(values, "console_h", settings->console_h);
 
     settings->detached_preview =
         parse_bool(values, "detached_preview", settings->detached_preview);
@@ -112,6 +116,10 @@ bool save_gui_settings(const GuiSettings& settings) {
     out << "window_w=" << settings.window_w << "\n";
     out << "window_h=" << settings.window_h << "\n";
     out << "maximized=" << (settings.maximized ? 1 : 0) << "\n";
+    out << "console_x=" << settings.console_x << "\n";
+    out << "console_y=" << settings.console_y << "\n";
+    out << "console_w=" << settings.console_w << "\n";
+    out << "console_h=" << settings.console_h << "\n";
     out << "detached_preview=" << (settings.detached_preview ? 1 : 0) << "\n";
     out << "preview_x=" << settings.preview_x << "\n";
     out << "preview_y=" << settings.preview_y << "\n";

@@ -73,6 +73,10 @@ const ImVec4 kGreen(0.36f, 0.85f, 0.50f, 1.0f);
 const ImVec4 kYellow(0.95f, 0.75f, 0.30f, 1.0f);
 const ImVec4 kMuted(0.55f, 0.60f, 0.66f, 1.0f);
 
+// WM_GETMINMAXINFO can arrive before WM_NCCREATE, when the per-window user
+// data is not set yet. This flag lets the console strip start narrow.
+bool g_console_min_size = false;
+
 const wchar_t kVideoFilter[] =
     L"视频文件\0*.mp4;*.mkv;*.mov;*.avi;*.ts\0所有文件\0*.*\0";
 
@@ -197,6 +201,9 @@ constexpr ExportFormat kExportFormats[] = {
     {"MP4 / H.265", "mp4", "h265"},
     {"MKV / H.265", "mkv", "h265"},
     {"MOV / H.265", "mov", "h265"},
+    {"MP4 / AV1", "mp4", "av1"},
+    {"MKV / AV1", "mkv", "av1"},
+    {"MOV / AV1", "mov", "av1"},
 };
 constexpr int kExportFormatCount = static_cast<int>(std::size(kExportFormats));
 
@@ -379,6 +386,7 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     Clock::time_point key_copied_until_{};
     GuiSettings settings_;
     bool detached_preview_ = false;
+    bool start_detached_ = false;
     std::unique_ptr<PreviewWindow> preview_window_;
     ExportState export_;
     std::wstring export_path_encode_;
@@ -459,6 +467,12 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void handle_player_hotkeys();
     void draw_preview_toolbar();
     void set_detached_preview(bool detached);
+    void restore_detached_preview();
+    bool ensure_preview_window();
+    void store_main_rect(bool console);
+    void restore_merged_window_rect();
+    void apply_console_rect();
+    void place_preview_to_right();
     void update_detached_preview();
     bool start_export(bool for_decode);
     void update_export();
@@ -582,6 +596,15 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     open_log();
     load_gui_settings(&settings_);
+    if (settings_.console_w < 380 || settings_.console_w > 700) {
+        settings_.console_w = 480;
+    }
+    if (settings_.console_h < 620) settings_.console_h = 820;
+    parse_command_line();
+    start_detached_ =
+        auto_no_detach_ ? false : (auto_detach_ || settings_.detached_preview);
+    detached_preview_ = start_detached_;
+    g_console_min_size = detached_preview_;
     export_bitrate_ = std::clamp(settings_.export_bitrate, 1, 100);
     export_path_encode_ = settings_.export_path_encode;
     export_path_decode_ = settings_.export_path_decode;
@@ -598,10 +621,7 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     if (!init_window(instance)) return false;
     if (!init_d3d()) return false;
     if (!init_imgui()) return false;
-    parse_command_line();
-    if (settings_.detached_preview || auto_detach_) {
-        if (!auto_no_detach_) set_detached_preview(true);
-    }
+    if (start_detached_) restore_detached_preview();
     log_line("GUI started");
     apply_auto_start();
     return true;
@@ -756,21 +776,29 @@ void GuiApp::Impl::apply_auto_start() {
     }
 }
 
-void GuiApp::Impl::save_settings() {
-    if (hwnd_) {
-        WINDOWPLACEMENT placement{};
-        placement.length = sizeof(placement);
-        if (GetWindowPlacement(hwnd_, &placement)) {
-            settings_.maximized = placement.showCmd == SW_SHOWMAXIMIZED;
-            const RECT& rect = placement.rcNormalPosition;
-            if (rect.right > rect.left && rect.bottom > rect.top) {
-                settings_.window_x = rect.left;
-                settings_.window_y = rect.top;
-                settings_.window_w = rect.right - rect.left;
-                settings_.window_h = rect.bottom - rect.top;
-            }
-        }
+void GuiApp::Impl::store_main_rect(bool console) {
+    if (!hwnd_) return;
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(hwnd_, &placement)) return;
+    const RECT& rect = placement.rcNormalPosition;
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+    if (console) {
+        settings_.console_x = rect.left;
+        settings_.console_y = rect.top;
+        settings_.console_w = rect.right - rect.left;
+        settings_.console_h = rect.bottom - rect.top;
+    } else {
+        settings_.window_x = rect.left;
+        settings_.window_y = rect.top;
+        settings_.window_w = rect.right - rect.left;
+        settings_.window_h = rect.bottom - rect.top;
+        settings_.maximized = placement.showCmd == SW_SHOWMAXIMIZED;
     }
+}
+
+void GuiApp::Impl::save_settings() {
+    store_main_rect(detached_preview_);
     if (preview_window_) {
         RECT rect{};
         preview_window_->get_window_rect(&rect);
@@ -877,8 +905,9 @@ LRESULT CALLBACK GuiApp::Impl::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lp);
-            info->ptMinTrackSize.x = 1000;
-            info->ptMinTrackSize.y = 680;
+            const bool console = (self && self->detached_preview_) || g_console_min_size;
+            info->ptMinTrackSize.x = console ? 380 : 1000;
+            info->ptMinTrackSize.y = console ? 620 : 680;
             return 0;
         }
         default:
@@ -901,17 +930,29 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
         return false;
     }
 
+    const bool console_mode = detached_preview_;
+    const int min_width = console_mode ? 380 : 1000;
+    const int min_height = console_mode ? 620 : 680;
     RECT window_rect{};
-    bool have_saved_rect = settings_.window_w >= 1000 && settings_.window_h >= 680 &&
-                           settings_.window_x != INT_MIN &&
-                           settings_.window_y != INT_MIN;
+    bool have_saved_rect =
+        console_mode
+            ? (settings_.console_x != INT_MIN && settings_.console_y != INT_MIN &&
+               settings_.console_w >= min_width && settings_.console_h >= min_height)
+            : (settings_.window_x != INT_MIN && settings_.window_y != INT_MIN &&
+               settings_.window_w >= min_width && settings_.window_h >= min_height);
     if (have_saved_rect) {
-        window_rect = {settings_.window_x, settings_.window_y,
-                       settings_.window_x + settings_.window_w,
-                       settings_.window_y + settings_.window_h};
-        window_rect = clamp_window_rect(window_rect, 1000, 680);
+        if (console_mode) {
+            window_rect = {settings_.console_x, settings_.console_y,
+                           settings_.console_x + settings_.console_w,
+                           settings_.console_y + settings_.console_h};
+        } else {
+            window_rect = {settings_.window_x, settings_.window_y,
+                           settings_.window_x + settings_.window_w,
+                           settings_.window_y + settings_.window_h};
+        }
+        window_rect = clamp_window_rect(window_rect, min_width, min_height);
     } else {
-        window_rect = {0, 0, 1280, 820};
+        window_rect = {0, 0, console_mode ? 480 : 1280, 820};
         RECT adjusted = window_rect;
         AdjustWindowRect(&adjusted, WS_OVERLAPPEDWINDOW, FALSE);
         window_rect = {0, 0, adjusted.right - adjusted.left,
@@ -947,7 +988,7 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
                  GetThreadDpiAwarenessContext())));
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
-    if (settings_.maximized) ShowWindow(hwnd_, SW_MAXIMIZE);
+    if (!detached_preview_ && settings_.maximized) ShowWindow(hwnd_, SW_MAXIMIZE);
     return true;
 }
 
@@ -1190,9 +1231,13 @@ void GuiApp::Impl::draw() {
         export_.cancel_requested = true;
     }
 
-    if (mode_ == Mode::Decode && dec_.running && !ImGui::GetIO().WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-        request_video_settings();
+    if (mode_ == Mode::Decode && dec_.running && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+            request_video_settings();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_F6, false)) {
+            apply_manual_decode_settings();
+        }
     }
 
     handle_player_hotkeys();
@@ -1209,14 +1254,6 @@ void GuiApp::Impl::draw() {
 }
 
 void GuiApp::Impl::draw_header() {
-    const ImVec4 accent = kAccent;
-    ImGui::PushStyleColor(ImGuiCol_Text, accent);
-    ImGui::TextUnformatted("OBSCure");
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::TextDisabled("实时画面混淆");
-    ImGui::SameLine(220.0f);
-
     auto tab = [this](const char* label, Mode target) {
         const bool active = mode_ == target;
         if (active) {
@@ -1227,19 +1264,40 @@ void GuiApp::Impl::draw_header() {
         if (active) ImGui::PopStyleColor(2);
         if (clicked) mode_ = target;
     };
+
+    const ImVec4 accent = kAccent;
+    ImGui::PushStyleColor(ImGuiCol_Text, accent);
+    ImGui::TextUnformatted("OBSCure");
+    ImGui::PopStyleColor();
+
+    const bool running = enc_.running || dec_.running;
+    if (detached_preview_) {
+        ImGui::SameLine(100.0f);
+        tab("编码", Mode::Encode);
+        ImGui::SameLine();
+        tab("解码", Mode::Decode);
+        ImGui::TextDisabled("keyID %08X", key_id());
+        ImGui::SameLine();
+        ImGui::TextColored(running ? kGreen : kYellow, running ? "● 运行中"
+                                                              : "● 就绪");
+        return;
+    }
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("实时画面混淆");
+    ImGui::SameLine(220.0f);
     tab("编码", Mode::Encode);
     ImGui::SameLine();
     tab("解码", Mode::Decode);
-
     ImGui::SameLine();
     ImGui::TextDisabled("keyID %08X", key_id());
     ImGui::SameLine();
-    const bool running = enc_.running || dec_.running;
     ImGui::TextColored(running ? kGreen : kYellow, running ? "● 运行中" : "● 就绪");
 }
 
 void GuiApp::Impl::draw_encode() {
-    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - 62.0f);
+    const float action_h = detached_preview_ ? 112.0f : 62.0f;
+    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - action_h);
     const float left_w = detached_preview_
                              ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
                              : 370.0f;
@@ -1255,7 +1313,7 @@ void GuiApp::Impl::draw_encode() {
     ImGui::BeginDisabled(enc_.running);
     ImGui::Checkbox("颜色混淆", &enc_use_color_);
     ImGui::EndDisabled();
-    ImGui::TextWrapped("关闭后保留原色；位置/翻转混淆仍启用。");
+    ImGui::TextWrapped("关闭后保留原色；\n位置/翻转混淆仍启用。");
     ImGui::Separator();
     draw_key();
     draw_export_ui(false);
@@ -1333,7 +1391,7 @@ void GuiApp::Impl::draw_encode_source() {
         }
     }
     ImGui::EndDisabled();
-    ImGui::TextWrapped("窗口捕获需要窗口可见；独占全屏游戏建议用无边框模式。");
+    ImGui::TextWrapped("窗口捕获需要窗口可见。\n独占全屏游戏建议用无边框模式。");
     draw_player_bar(false);
 }
 
@@ -1439,7 +1497,7 @@ void GuiApp::Impl::draw_key() {
     }
     ImGui::TextDisabled("keyID %08X", key_id());
     if (public_mode_) {
-        ImGui::TextWrapped("公开模式：内置公开密钥，任何人安装 OBSCure 后都能解码。");
+        ImGui::TextWrapped("公开模式：内置公开密钥，\n任何人安装 OBSCure 后都能解码。");
     } else {
         ImGui::TextWrapped("两端必须一致；解码中修改后点“应用设置”。");
     }
@@ -1540,6 +1598,29 @@ void GuiApp::Impl::draw_encode_preview() {
 }
 
 void GuiApp::Impl::draw_encode_actions() {
+    if (detached_preview_) {
+        ImGui::BeginChild("##enc_actions", ImVec2(0, 104), ImGuiChildFlags_None);
+        if (enc_.running) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+            if (ImGui::Button("停止", ImVec2(-1, 34))) stop_encode();
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
+            if (ImGui::Button("开始混淆", ImVec2(-1, 34))) start_encode();
+            ImGui::PopStyleColor();
+        }
+        ImGui::TextWrapped("%s · 渲染 %.1f fps",
+                           enc_.running ? "编码中" : "已停止", enc_.fps);
+        if (enc_.output_window) {
+            if (ImGui::Button("显示输出窗口", ImVec2(-1, 28))) {
+                enc_.output_window->show();
+            }
+        }
+        ImGui::EndChild();
+        return;
+    }
+
     ImGui::BeginChild("##enc_actions", ImVec2(0, 56), ImGuiChildFlags_None);
     if (enc_.running) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
@@ -1562,7 +1643,8 @@ void GuiApp::Impl::draw_encode_actions() {
 }
 
 void GuiApp::Impl::draw_decode() {
-    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - 62.0f);
+    const float action_h = detached_preview_ ? 116.0f : 62.0f;
+    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - action_h);
     const float left_w = detached_preview_
                              ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
                              : 370.0f;
@@ -1576,7 +1658,7 @@ void GuiApp::Impl::draw_decode() {
     ImGui::Checkbox("颜色还原", &dec_.use_color);
     ImGui::Checkbox("自动匹配视频设置", &auto_match_settings_);
     draw_video_info();
-    ImGui::TextWrapped("修改档位/密钥/颜色后，点“应用设置”立即生效。");
+    ImGui::TextWrapped("修改档位/密钥/颜色后，\n点“应用设置”立即生效。");
     ImGui::Separator();
     ImGui::TextDisabled("边缘内缩");
     const char* margin_items[] = {"自动", "0 px", "1 px", "2 px"};
@@ -1585,7 +1667,7 @@ void GuiApp::Impl::draw_decode() {
         margin_override_ = margin_index - 1;
         if (margin_override_ >= 0) dec_.margin = margin_override_;
     }
-    ImGui::TextWrapped("自动：大窗口内缩 1px；c64 1:1 也会内缩，减少 cell 白边。");
+    ImGui::TextWrapped("自动：大窗口内缩 1px。\nc64 1:1 也会内缩，减少 cell 白边。");
     ImGui::Separator();
     draw_key();
     draw_export_ui(true);
@@ -1659,7 +1741,7 @@ void GuiApp::Impl::draw_decode_source() {
         }
     }
     ImGui::Checkbox("独立预览窗口", &dec_.fullscreen);
-    ImGui::TextWrapped("文件模式默认按精确传输帧解码；窗口/显示器会自动定位。");
+    ImGui::TextWrapped("文件模式默认直接解码。\n播放器录屏请勾选“启用定位”。");
     ImGui::EndDisabled();
     draw_player_bar(true);
 }
@@ -1743,55 +1825,175 @@ void GuiApp::Impl::draw_preview_toolbar() {
     }
     if (preview_window_ && !preview_window_->visible()) {
         ImGui::SameLine();
-        if (ImGui::Button("显示播放窗口", ImVec2(120, 28))) {
+        if (ImGui::Button("显示", ImVec2(60, 28))) {
             preview_window_->show();
         }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("播放画面已分离");
+    ImGui::TextWrapped("播放画面已分离");
+    if (mode_ == Mode::Encode) {
+        if (enc_.running) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+            if (ImGui::Button("停止混淆", ImVec2(110, 30))) stop_encode();
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
+            if (ImGui::Button("开始混淆", ImVec2(110, 30))) start_encode();
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.1f fps", enc_.fps);
+    } else {
+        if (dec_.running) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+            if (ImGui::Button("停止解码", ImVec2(110, 30))) stop_decode();
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
+            if (ImGui::Button("开始解码", ImVec2(110, 30))) start_decode();
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.1f fps", dec_.fps);
+    }
+}
+
+bool GuiApp::Impl::ensure_preview_window() {
+    if (preview_window_) return true;
+    RECT rect{};
+    const bool have_rect = settings_.preview_w >= 320 && settings_.preview_h >= 180 &&
+                           settings_.preview_x != INT_MIN &&
+                           settings_.preview_y != INT_MIN;
+    if (have_rect) {
+        rect = {settings_.preview_x, settings_.preview_y,
+                settings_.preview_x + settings_.preview_w,
+                settings_.preview_y + settings_.preview_h};
+    } else {
+        RECT main_rect{};
+        GetWindowRect(hwnd_, &main_rect);
+        rect = {main_rect.right + 16, main_rect.top,
+                main_rect.right + 16 + 960, main_rect.top + 540};
+    }
+    rect = clamp_window_rect(rect, 320, 180);
+
+    auto window = std::make_unique<PreviewWindow>();
+    std::string error;
+    if (!window->init(device_.Get(), context_.Get(), rect, L"OBScure 播放画面",
+                      resolve_shader_path(L"blit.hlsl"), &error)) {
+        set_error("创建播放窗口失败: " + error);
+        return false;
+    }
+    preview_window_ = std::move(window);
+    preview_window_->set_topmost(settings_.preview_topmost);
+    return true;
+}
+
+void GuiApp::Impl::restore_merged_window_rect() {
+    g_console_min_size = false;
+    RECT rect{};
+    const bool have_rect = settings_.window_w >= 1000 && settings_.window_h >= 680 &&
+                           settings_.window_x != INT_MIN &&
+                           settings_.window_y != INT_MIN;
+    if (have_rect) {
+        rect = {settings_.window_x, settings_.window_y,
+                settings_.window_x + settings_.window_w,
+                settings_.window_y + settings_.window_h};
+    } else {
+        rect = {0, 0, 1280, 820};
+        RECT adjusted = rect;
+        AdjustWindowRect(&adjusted, WS_OVERLAPPEDWINDOW, FALSE);
+        rect = {0, 0, adjusted.right - adjusted.left,
+                adjusted.bottom - adjusted.top};
+    }
+    rect = clamp_window_rect(rect, 1000, 680);
+    ShowWindow(hwnd_, SW_RESTORE);
+    SetWindowPos(hwnd_, nullptr, rect.left, rect.top, rect.right - rect.left,
+                 rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (settings_.maximized) ShowWindow(hwnd_, SW_MAXIMIZE);
+}
+
+void GuiApp::Impl::apply_console_rect() {
+    g_console_min_size = true;
+    RECT console{};
+    const bool have_console = settings_.console_w >= 380 &&
+                              settings_.console_h >= 620 &&
+                              settings_.console_x != INT_MIN &&
+                              settings_.console_y != INT_MIN;
+    if (have_console) {
+        console = {settings_.console_x, settings_.console_y,
+                   settings_.console_x + settings_.console_w,
+                   settings_.console_y + settings_.console_h};
+    } else {
+        RECT main_rect{};
+        GetWindowRect(hwnd_, &main_rect);
+        const long height = std::max(500L, main_rect.bottom - main_rect.top);
+        console = {main_rect.left, main_rect.top, main_rect.left + 480,
+                   main_rect.top + height};
+    }
+    console = clamp_window_rect(console, 380, 620);
+    ShowWindow(hwnd_, SW_RESTORE);
+    SetWindowPos(hwnd_, nullptr, console.left, console.top,
+                 console.right - console.left, console.bottom - console.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void GuiApp::Impl::place_preview_to_right() {
+    if (!preview_window_) return;
+    RECT main_rect{};
+    GetWindowRect(hwnd_, &main_rect);
+    RECT prev{};
+    preview_window_->get_window_rect(&prev);
+    int prev_w = prev.right - prev.left;
+    int prev_h = prev.bottom - prev.top;
+    if (prev_w < 320 || prev_h < 180) {
+        prev_w = 960;
+        prev_h = 540;
+    }
+    if (prev.left < main_rect.right + 8) {
+        preview_window_->set_window_rect(
+            {main_rect.right + 16, main_rect.top,
+             main_rect.right + 16 + prev_w, main_rect.top + prev_h});
+    }
+}
+
+void GuiApp::Impl::restore_detached_preview() {
+    if (!detached_preview_) return;
+    apply_console_rect();
+    if (!ensure_preview_window()) {
+        detached_preview_ = false;
+        restore_merged_window_rect();
+        return;
+    }
+    place_preview_to_right();
+    preview_window_->set_topmost(settings_.preview_topmost);
+    preview_window_->show();
 }
 
 void GuiApp::Impl::set_detached_preview(bool detached) {
     if (detached == detached_preview_) return;
     if (!detached) {
+        store_main_rect(true);
         if (preview_window_) preview_window_->hide();
         detached_preview_ = false;
         settings_.detached_preview = false;
+        restore_merged_window_rect();
         save_settings();
         return;
     }
 
-    if (!preview_window_) {
-        RECT rect{};
-        bool have_rect = settings_.preview_w >= 320 && settings_.preview_h >= 180 &&
-                         settings_.preview_x != INT_MIN &&
-                         settings_.preview_y != INT_MIN;
-        if (have_rect) {
-            rect = {settings_.preview_x, settings_.preview_y,
-                    settings_.preview_x + settings_.preview_w,
-                    settings_.preview_y + settings_.preview_h};
-            rect = clamp_window_rect(rect, 320, 180);
-        } else {
-            RECT main_rect{};
-            GetWindowRect(hwnd_, &main_rect);
-            rect = {main_rect.right + 16, main_rect.top,
-                    main_rect.right + 16 + 960, main_rect.top + 540};
-            rect = clamp_window_rect(rect, 320, 180);
-        }
-
-        auto window = std::make_unique<PreviewWindow>();
-        std::string error;
-        if (!window->init(device_.Get(), context_.Get(), rect, L"OBScure 播放画面",
-                          resolve_shader_path(L"blit.hlsl"), &error)) {
-            set_error("创建播放窗口失败: " + error);
-            return;
-        }
-        preview_window_ = std::move(window);
+    // Remember the wide, merged window before shrinking to the console strip.
+    store_main_rect(false);
+    detached_preview_ = true;
+    apply_console_rect();
+    if (!ensure_preview_window()) {
+        detached_preview_ = false;
+        restore_merged_window_rect();
+        return;
     }
-
+    place_preview_to_right();
     preview_window_->set_topmost(settings_.preview_topmost);
     preview_window_->show();
-    detached_preview_ = true;
     settings_.detached_preview = true;
     save_settings();
 }
@@ -2126,8 +2328,9 @@ bool GuiApp::Impl::start_export(bool for_decode) {
     }
 
     state.sink = std::make_unique<FfmpegSink>();
-    const VideoCodec codec =
-        state.codec == "h265" ? VideoCodec::H265 : VideoCodec::H264;
+    const VideoCodec codec = state.codec == "h265"   ? VideoCodec::H265
+                             : state.codec == "av1" ? VideoCodec::Av1
+                                                    : VideoCodec::H264;
     if (!state.sink->start(device_.Get(), context_.Get(), state.width, state.height,
                            state.fps, state.bitrate, state.output_path, &error,
                            codec)) {
@@ -2296,10 +2499,10 @@ void GuiApp::Impl::draw_export_ui(bool for_decode) {
         return;
     }
 
-    static const char* labels[] = {
-        "MP4 / H.264", "MKV / H.264", "MOV / H.264",
-        "MP4 / H.265", "MKV / H.265", "MOV / H.265",
-    };
+    const char* labels[kExportFormatCount]{};
+    for (int i = 0; i < kExportFormatCount; ++i) {
+        labels[i] = kExportFormats[i].label;
+    }
     int format_index = std::clamp(export_format_index_, 0, kExportFormatCount - 1);
     ImGui::SetNextItemWidth(180);
     if (ImGui::Combo("格式##export", &format_index, labels, kExportFormatCount)) {
@@ -2518,6 +2721,31 @@ void GuiApp::Impl::draw_video_info() {
 }
 
 void GuiApp::Impl::draw_decode_actions() {
+    if (detached_preview_) {
+        ImGui::BeginChild("##dec_actions", ImVec2(0, 108), ImGuiChildFlags_None);
+        if (dec_.running) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+            if (ImGui::Button("停止", ImVec2(130, 34))) stop_decode();
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::Button("重新识别", ImVec2(140, 34))) reset_decode_detection();
+            if (ImGui::Button("读取设置", ImVec2(130, 34))) request_video_settings();
+            ImGui::SameLine();
+            if (ImGui::Button("应用设置", ImVec2(110, 34))) {
+                apply_manual_decode_settings();
+            }
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
+            if (ImGui::Button("开始解码", ImVec2(-1, 34))) start_decode();
+            ImGui::PopStyleColor();
+        }
+        ImGui::TextWrapped("%s · 解码 %.1f fps",
+                           dec_.running ? "解码中" : "已停止", dec_.fps);
+        ImGui::EndChild();
+        return;
+    }
+
     ImGui::BeginChild("##dec_actions", ImVec2(0, 56), ImGuiChildFlags_None);
     if (dec_.running) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
@@ -2551,6 +2779,12 @@ void GuiApp::Impl::draw_decode_actions() {
 
 void GuiApp::Impl::draw_status_bar() {
     ImGui::Separator();
+    if (detached_preview_) {
+        ImGui::TextDisabled("编码 %.1f fps · 解码 %.1f fps",
+                            enc_.running ? enc_.fps : 0.0,
+                            dec_.running ? dec_.fps : 0.0);
+        return;
+    }
     ImGui::TextDisabled("OBScure v0.3 · 分离窗口 / 文件播放 / 离线导出");
     ImGui::SameLine(ImGui::GetWindowWidth() - 290);
     ImGui::TextDisabled("编码 %.1f fps · 解码 %.1f fps",

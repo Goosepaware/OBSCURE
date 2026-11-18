@@ -16,6 +16,7 @@ namespace obs {
 enum class VideoCodec {
     H264,
     H265,
+    Av1,
 };
 
 // Encodes D3D11 BGRA frames to an H.264/H.265 file through ffmpeg's stdin.

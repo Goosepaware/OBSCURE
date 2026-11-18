@@ -106,7 +106,11 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
         << L" -hide_banner -loglevel error -y"
         << L" -f rawvideo -pixel_format bgra -video_size " << width_ << L"x" << height_
         << L" -framerate " << fps << L" -i - -an";
-    if (codec_ == VideoCodec::H265) {
+    if (codec_ == VideoCodec::Av1) {
+        cmd << L" -c:v libsvtav1 -preset 8"
+            << L" -b:v " << br << L"M";
+        if (mp4_like) cmd << L" -tag:v av01";
+    } else if (codec_ == VideoCodec::H265) {
         cmd << L" -c:v libx265 -preset medium"
             << L" -b:v " << br << L"M -maxrate " << br << L"M -bufsize " << (br * 2)
             << L"M"

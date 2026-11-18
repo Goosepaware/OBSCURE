@@ -12,6 +12,11 @@ struct GuiSettings {
     int window_h = 0;
     bool maximized = false;
 
+    int console_x = INT_MIN;
+    int console_y = INT_MIN;
+    int console_w = 480;
+    int console_h = 820;
+
     bool detached_preview = false;
     int preview_x = INT_MIN;
     int preview_y = INT_MIN;
