@@ -1,0 +1,22 @@
+# Build outputs
+/build/
+/out/
+
+# Large local assets
+/sample/
+/third_party/
+/work/tools/
+
+# FFmpeg shared build
+/*.exe
+/*.dll
+
+# Logs and archives
+*.log
+*.zip
+*.7z
+
+# Test artifacts
+*.mp4
+*.png
+*.bmp
