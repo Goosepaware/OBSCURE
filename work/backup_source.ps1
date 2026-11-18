@@ -21,7 +21,11 @@ $items = @(
     (Join-Path $root 'CMakeLists.txt'),
     (Join-Path $root 'README.md'),
     (Join-Path $root 'AGENTS.md'),
-    (Join-Path $root '.gitignore')
+    (Join-Path $root '.gitignore'),
+    (Join-Path $root 'third_party\UnityCapture\Source\shared.inl'),
+    (Join-Path $root 'third_party\UnityCapture\Source\streams.h'),
+    (Join-Path $root 'third_party\UnityCapture\Source\streams.cpp'),
+    (Join-Path $root 'third_party\UnityCapture\Source\UnityCaptureFilter.def')
 ) | Where-Object { Test-Path -LiteralPath $_ }
 
 Compress-Archive -LiteralPath $items -DestinationPath $zip -Force
