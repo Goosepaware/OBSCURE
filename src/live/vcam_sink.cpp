@@ -118,7 +118,7 @@ void VcamSink::send(ID3D11Texture2D* texture) {
     if (!ready_) {
         const auto now = std::chrono::steady_clock::now();
         if (now < next_retry_) return;
-        next_retry_ = now + std::chrono::seconds(1);
+        next_retry_ = now + std::chrono::milliseconds(250);
         if (!try_open()) return;
     }
 
@@ -142,7 +142,7 @@ void VcamSink::send(ID3D11Texture2D* texture) {
     // advance), not a byte pitch.
     header->stride = width_;
     header->format = kFormatUint8;
-    header->resize_mode = 0;
+    header->resize_mode = 1;
     header->mirror_mode = 0;
     header->timeout = 1000;
 
