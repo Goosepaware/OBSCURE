@@ -51,6 +51,18 @@ std::array<uint8_t, 32> sha256(const std::string& text) {
     return sha256(text.data(), text.size());
 }
 
+uint32_t key_id_from_text(const std::string& text) {
+    const auto id = sha256("OBSCure-key-id|" + text);
+    return (static_cast<uint32_t>(id[0]) << 24) |
+           (static_cast<uint32_t>(id[1]) << 16) |
+           (static_cast<uint32_t>(id[2]) << 8) |
+           static_cast<uint32_t>(id[3]);
+}
+
+uint32_t public_key_id() {
+    return key_id_from_text(kPublicKey);
+}
+
 KeyMaterial derive_key(const Layout& layout) {
     layout.validate();
     const std::string seed_text =
@@ -90,11 +102,7 @@ KeyMaterial derive_key(const Layout& layout) {
         km.color[static_cast<size_t>(i)] = static_cast<uint8_t>(rng() & 7u);
     }
 
-    const auto id = sha256("OBSCure-key-id|" + layout.key);
-    km.key_id = (static_cast<uint32_t>(id[0]) << 24) |
-                (static_cast<uint32_t>(id[1]) << 16) |
-                (static_cast<uint32_t>(id[2]) << 8) |
-                static_cast<uint32_t>(id[3]);
+    km.key_id = key_id_from_text(layout.key);
     return km;
 }
 

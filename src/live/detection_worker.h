@@ -2,12 +2,14 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include <opencv2/core.hpp>
 
 #include "core/key.h"
 #include "core/layout.h"
+#include "core/metadata.h"
 
 namespace obs {
 
@@ -18,6 +20,7 @@ struct DetectionOutcome {
     bool key_ok = false;
     int markers = 0;
     double ms = 0.0;
+    std::optional<Metadata> metadata;
 };
 
 // Runs ArUco detection away from the render thread. Submit at ~1 Hz; take()

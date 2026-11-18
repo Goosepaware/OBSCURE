@@ -28,6 +28,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -39,6 +40,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "core/detect.h"
 #include "core/key.h"
 #include "core/layout.h"
+#include "core/metadata.h"
+#include "core/presets.h"
 #include "io/ffmpeg_sink.h"
 #include "live/d3d_helpers.h"
 #include "live/decode_pipeline.h"
@@ -78,26 +81,6 @@ struct DpiScope {
         if (old) SetThreadDpiAwarenessContext(old);
     }
 };
-
-struct Preset {
-    const char* id;
-    const char* label;
-    int cell;
-    int guard;
-    double scale;
-    int bitrate;
-};
-
-constexpr Preset kPresets[] = {
-    {"c32_g2_s100", "高质量 32px / 1.0x", 32, 2, 1.0, 10},
-    {"c32_g2_s120", "平衡 32px / 1.2x（推荐）", 32, 2, 1.2, 8},
-    {"c32_g2_s140", "隐私 32px / 1.4x", 32, 2, 1.4, 6},
-    {"c16_g2_s100", "强隐私 16px / 2px", 16, 2, 1.0, 10},
-    {"c16_g1_s100", "强隐私 16px / 1px", 16, 1, 1.0, 10},
-    {"c64_g2_s100", "画质优先 64px / 1.0x", 64, 2, 1.0, 12},
-    {"c64_g2_s120", "画质优先 64px / 1.2x", 64, 2, 1.2, 12},
-};
-constexpr int kPresetCount = static_cast<int>(std::size(kPresets));
 
 std::string lower_ascii(std::string text) {
     for (char& c : text) {
@@ -153,11 +136,7 @@ double content_delta(const cv::Mat& a, const cv::Mat& b, const Layout& layout) {
 }
 
 uint32_t key_id_for_text(const std::string& key) {
-    const auto digest = sha256("OBSCure-key-id|" + key);
-    return (static_cast<uint32_t>(digest[0]) << 24) |
-           (static_cast<uint32_t>(digest[1]) << 16) |
-           (static_cast<uint32_t>(digest[2]) << 8) |
-           static_cast<uint32_t>(digest[3]);
+    return key_id_from_text(key);
 }
 
 std::string window_label(const WindowInfo& info) {
@@ -243,6 +222,12 @@ struct GuiApp::Impl {
         int markers = 0;
         double detect_ms = 0.0;
         int detect_tick = 0;
+        bool use_color = true;
+        bool use_dihedral = true;
+        std::optional<Metadata> video_meta;
+        bool metadata_applied = false;
+        bool metadata_read_pending = false;
+        Clock::time_point metadata_read_deadline{};
         cv::Mat last_detect_frame;
         Clock::time_point last_fail_dump{};
         Clock::time_point last_detect_log{};
@@ -277,6 +262,11 @@ struct GuiApp::Impl {
     int preset_index_ = 1;
 int record_bitrate_ = 8;
 int margin_override_ = -1;  // -1 auto, 0/1/2 manual
+    bool public_mode_ = false;
+    bool enc_use_color_ = true;
+    bool show_key_ = false;
+    bool auto_match_settings_ = true;
+    Clock::time_point key_copied_until_{};
     EncodeState enc_;
     DecodeState dec_;
     std::vector<MonitorInfo> monitors_;
@@ -338,6 +328,7 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void draw_encode_preview();
     void draw_decode_source();
     void draw_decode_preview();
+    void draw_video_info();
     void draw_encode_actions();
     void draw_decode_actions();
     void draw_status_bar();
@@ -358,6 +349,14 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void update_decode();
     void reset_decode_detection();
     void apply_detection(const DetectionOutcome& outcome);
+    bool create_decode_pipeline(const Layout& layout, const KeyMaterial& key,
+                                bool use_color, bool use_dihedral, std::string* error);
+    void recreate_decode_detector(bool enable);
+    void sync_decode_preview_window();
+    bool apply_video_metadata(const Metadata& metadata, bool force);
+    bool apply_manual_decode_settings();
+    void request_video_settings();
+    std::optional<Metadata> read_file_metadata();
     bool read_source_bgr(cv::Mat& bgr);
 
     void upload_bgr(const cv::Mat& bgr, ComPtr<ID3D11Texture2D>& texture,
@@ -474,6 +473,14 @@ void GuiApp::Impl::parse_command_line() {
             for (int j = 0; j < kPresetCount; ++j) {
                 if (id == kPresets[j].id) preset_index_ = j;
             }
+        } else if (arg == L"--key" && i + 1 < argc) {
+            const std::string text = wide_to_utf8(argv[++i]);
+            strncpy_s(key_buf_, text.c_str(), _TRUNCATE);
+        } else if (arg == L"--public") {
+            public_mode_ = true;
+        } else if (arg == L"--no-color") {
+            enc_use_color_ = false;
+            dec_.use_color = false;
         } else if (arg == L"--auto") {
             auto_start_ = true;
         } else if (arg == L"--spout") {
@@ -582,6 +589,7 @@ void GuiApp::Impl::set_error(const std::string& text) {
 }
 
 uint32_t GuiApp::Impl::key_id() {
+    if (public_mode_) return public_key_id();
     if (ui_key_cache_ != key_buf_) {
         ui_key_cache_ = key_buf_;
         ui_key_id_ = key_id_for_text(ui_key_cache_);
@@ -891,6 +899,11 @@ void GuiApp::Impl::draw() {
         ImGui::PopStyleColor();
     }
 
+    if (mode_ == Mode::Decode && dec_.running && !ImGui::GetIO().WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+        request_video_settings();
+    }
+
     if (mode_ == Mode::Encode) {
         draw_encode();
     } else {
@@ -940,6 +953,11 @@ void GuiApp::Impl::draw_encode() {
     draw_encode_outputs();
     ImGui::Separator();
     draw_presets();
+    ImGui::Separator();
+    ImGui::BeginDisabled(enc_.running);
+    ImGui::Checkbox("颜色混淆", &enc_use_color_);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("关闭后保留原色；位置/翻转混淆仍启用。");
     ImGui::Separator();
     draw_key();
     ImGui::EndChild();
@@ -1069,7 +1087,7 @@ void GuiApp::Impl::draw_encode_outputs() {
 
 void GuiApp::Impl::draw_presets() {
     ImGui::TextDisabled("画质档位");
-    ImGui::BeginDisabled(enc_.running || dec_.running);
+    ImGui::BeginDisabled(enc_.running);
     const char* preview = kPresets[preset_index_].label;
     if (ImGui::BeginCombo("##preset", preview)) {
         for (int i = 0; i < kPresetCount; ++i) {
@@ -1090,12 +1108,36 @@ void GuiApp::Impl::draw_presets() {
 
 void GuiApp::Impl::draw_key() {
     ImGui::TextDisabled("共享密钥");
-    ImGui::BeginDisabled(enc_.running || dec_.running);
-    ImGui::InputText("##key", key_buf_, sizeof(key_buf_),
-                     ImGuiInputTextFlags_Password);
+    ImGui::BeginDisabled(enc_.running);
+    ImGui::Checkbox("无密钥模式（公开视频）", &public_mode_);
     ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(enc_.running || public_mode_);
+    ImGui::SetNextItemWidth(168);
+    ImGui::InputText("##key", key_buf_, sizeof(key_buf_),
+                     show_key_ ? 0 : ImGuiInputTextFlags_Password);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(show_key_ ? "隐藏" : "显示", ImVec2(48, 0))) {
+        show_key_ = !show_key_;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(public_mode_);
+    if (ImGui::Button("复制", ImVec2(48, 0))) {
+        ImGui::SetClipboardText(key_buf_);
+        key_copied_until_ = Clock::now() + std::chrono::seconds(2);
+    }
+    ImGui::EndDisabled();
+    if (Clock::now() < key_copied_until_) {
+        ImGui::SameLine();
+        ImGui::TextColored(kGreen, "已复制");
+    }
     ImGui::TextDisabled("keyID %08X", key_id());
-    ImGui::TextWrapped("两端必须一致；修改密钥后需重新开始。");
+    if (public_mode_) {
+        ImGui::TextWrapped("公开模式：内置公开密钥，任何人安装 OBSCure 后都能解码。");
+    } else {
+        ImGui::TextWrapped("两端必须一致；解码中修改后点“应用设置”。");
+    }
 }
 
 void GuiApp::Impl::draw_image_fit(ID3D11ShaderResourceView* srv, int width, int height,
@@ -1219,6 +1261,11 @@ void GuiApp::Impl::draw_decode() {
     draw_decode_source();
     ImGui::Separator();
     draw_presets();
+    ImGui::Separator();
+    ImGui::Checkbox("颜色还原", &dec_.use_color);
+    ImGui::Checkbox("自动匹配视频设置", &auto_match_settings_);
+    draw_video_info();
+    ImGui::TextDisabled("修改档位/密钥/颜色后，点“应用设置”立即生效。");
     ImGui::Separator();
     ImGui::TextDisabled("边缘内缩");
     const char* margin_items[] = {"自动", "0 px", "1 px", "2 px"};
@@ -1348,6 +1395,40 @@ void GuiApp::Impl::draw_decode_preview() {
     if (!dec_.error.empty()) ImGui::TextColored(kRed, "%s", dec_.error.c_str());
 }
 
+void GuiApp::Impl::draw_video_info() {
+    if (!dec_.video_meta) {
+        if (dec_.running) ImGui::TextDisabled("视频信息：等待识别...");
+        return;
+    }
+    const Metadata& m = *dec_.video_meta;
+    std::ostringstream info;
+    info << "视频信息：";
+    if (m.public_mode()) {
+        info << "公开视频（无需密钥）";
+    } else {
+        char id_buf[40]{};
+        sprintf_s(id_buf, "需要密钥 keyID %08X", m.key_id);
+        info << id_buf;
+    }
+    info << "\n档位：";
+    if (const auto* p = preset_by_id(m.preset_id)) {
+        info << p->id;
+    } else {
+        info << "自定义 cell " << m.cell << " · guard " << m.guard;
+        if (m.scale_x10 > 0) {
+            char scale_buf[24]{};
+            sprintf_s(scale_buf, " · %.1fx", m.scale_x10 / 10.0);
+            info << scale_buf;
+        }
+    }
+    info << (m.use_color() ? " · 颜色混淆 开" : " · 颜色混淆 关");
+    ImGui::TextWrapped("%s", info.str().c_str());
+    if (!m.public_mode() && m.key_id != dec_.key.key_id) {
+        ImGui::TextColored(kRed, "密钥不匹配：视频 keyID %08X，当前 keyID %08X",
+                           m.key_id, dec_.key.key_id);
+    }
+}
+
 void GuiApp::Impl::draw_decode_actions() {
     ImGui::BeginChild("##dec_actions", ImVec2(0, 56), ImGuiChildFlags_None);
     if (dec_.running) {
@@ -1356,6 +1437,10 @@ void GuiApp::Impl::draw_decode_actions() {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         if (ImGui::Button("重新识别定位点", ImVec2(180, 34))) reset_decode_detection();
+        ImGui::SameLine();
+        if (ImGui::Button("读取视频设置", ImVec2(150, 34))) request_video_settings();
+        ImGui::SameLine();
+        if (ImGui::Button("应用设置", ImVec2(110, 34))) apply_manual_decode_settings();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
         if (ImGui::Button("开始解码", ImVec2(150, 34))) start_decode();
@@ -1365,6 +1450,10 @@ void GuiApp::Impl::draw_decode_actions() {
     ImGui::TextDisabled("%s", dec_.running ? "解码中" : "已停止");
     ImGui::SameLine();
     ImGui::TextDisabled("解码 %.1f fps", dec_.fps);
+    if (dec_.running) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("F5 读取设置");
+    }
     if (dec_.fullscreen_window) {
         ImGui::SameLine();
         if (ImGui::Button("显示预览窗口")) dec_.fullscreen_window->show();
@@ -1591,7 +1680,7 @@ bool GuiApp::Impl::start_encode() {
     last_error_.clear();
     enc_.error.clear();
     try {
-        if (key_buf_[0] == '\0') {
+        if (!public_mode_ && key_buf_[0] == '\0') {
             set_error("密钥不能为空。");
             return false;
         }
@@ -1599,14 +1688,20 @@ bool GuiApp::Impl::start_encode() {
         Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
-        layout.key = key_buf_;
+        layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         layout.validate();
         const KeyMaterial key = derive_key(layout);
+        TransportOptions options;
+        options.use_color = enc_use_color_;
+        options.use_dihedral = true;
+        options.public_mode = public_mode_;
+        options.preset_id = preset_index_ + 1;
+        options.scale_x10 = preset_scale_x10(preset);
 
         auto encoder = std::make_unique<EncodePipeline>();
         std::string error;
         if (!encoder->init(device_.Get(), context_.Get(), layout, key, preset.scale,
-                           resolve_shader_path(L"transport.hlsl"), &error)) {
+                           options, resolve_shader_path(L"transport.hlsl"), &error)) {
             set_error("编码器初始化失败: " + error);
             return false;
         }
@@ -1836,26 +1931,25 @@ bool GuiApp::Impl::start_decode() {
     if (dec_.running) return true;
     last_error_.clear();
     dec_.error.clear();
+    dec_.video_meta.reset();
+    dec_.metadata_applied = false;
+    dec_.metadata_read_pending = false;
+    dec_.metadata_read_deadline = {};
     try {
-        if (key_buf_[0] == '\0') {
-            set_error("密钥不能为空。");
-            return false;
+        if (!public_mode_ && key_buf_[0] == '\0') {
+            // An empty decode key means "public video"; private transports still
+            // need the matching key entered before starting.
+            public_mode_ = true;
         }
         const Preset& preset = kPresets[preset_index_];
         Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
-        layout.key = key_buf_;
+        layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         layout.validate();
-        const KeyMaterial key = derive_key(layout);
-
-        auto decoder = std::make_unique<DecodePipeline>();
-        std::string error;
-        if (!decoder->init(device_.Get(), context_.Get(), layout, key,
-                           resolve_shader_path(L"decode.hlsl"), &error)) {
-            set_error("解码器初始化失败: " + error);
-            return false;
-        }
+        KeyMaterial key = derive_key(layout);
+        bool use_color = dec_.use_color;
+        bool use_dihedral = true;
 
         auto fail = [this](const std::string& message) {
             set_error(message);
@@ -1863,8 +1957,14 @@ bool GuiApp::Impl::start_decode() {
             return false;
         };
 
+        std::string error;
         dec_.detect_tick = 0;
-        dec_.detector.reset();
+        if (dec_.detector) {
+            dec_.detector->stop();
+            dec_.detector.reset();
+        }
+        dec_.last_detect_frame.release();
+
         if (dec_.source == DecodeState::Source::File) {
             if (dec_.file_path.empty()) return fail("请先选择混淆视频。");
             if (!dec_.file.open(dec_.file_path, &error)) {
@@ -1879,14 +1979,50 @@ bool GuiApp::Impl::start_decode() {
             dec_.source_h = first.rows;
             dec_.H_initial = identity_scaled(first.cols, first.rows);
             dec_.H = dec_.H_initial.clone();
-            dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
-            if (dec_.detect_file) {
-                dec_.detector = std::make_unique<DetectionWorker>(layout, key);
-                dec_.detector->start();
-                dec_.detector->submit(first);
-                dec_.locked = false;
-            } else {
-                dec_.locked = true;
+            dec_.margin = margin_override_ >= 0 ? margin_override_
+                                                : adaptive_margin(dec_.H, layout.cell);
+
+            // Exact transport files are full-frame and upright, so metadata can
+            // be read directly through the scaled identity homography. This
+            // avoids a visible settings jump on the first frame.
+            if (!dec_.detect_file) {
+                if (auto metadata = read_file_metadata()) {
+                    dec_.video_meta = metadata;
+                    auto target_layout = layout_from_metadata(*metadata);
+                    if (auto_match_settings_ && target_layout) {
+                        layout = *target_layout;
+                        if (metadata->public_mode()) {
+                            public_mode_ = true;
+                            layout.key = kPublicKey;
+                        } else {
+                            public_mode_ = false;
+                            layout.key = key_buf_;
+                        }
+                        key = derive_key(layout);
+                        use_color = metadata->use_color();
+                        use_dihedral = metadata->use_dihedral();
+                        if (const auto* p = preset_by_id(metadata->preset_id)) {
+                            const int idx = preset_index_by_id(p->id);
+                            if (idx >= 0) preset_index_ = idx;
+                        } else {
+                            const int idx = preset_index_by_geometry(
+                                metadata->cell, metadata->guard, metadata->scale_x10);
+                            if (idx >= 0) preset_index_ = idx;
+                        }
+                        dec_.metadata_applied = true;
+                    }
+                    dec_.key_ok = metadata->public_mode()
+                                      ? key.key_id == public_key_id()
+                                      : metadata->key_id == key.key_id;
+                    if (!dec_.key_ok) {
+                        char buf[128]{};
+                        sprintf_s(buf,
+                                  "密钥不匹配：视频 keyID %08X，当前 keyID %08X",
+                                  metadata->key_id, key.key_id);
+                        dec_.error = buf;
+                        log_line(std::string("decode metadata key mismatch: ") + buf);
+                    }
+                }
             }
         } else {
             auto capture = std::make_unique<WgcCapture>();
@@ -1939,33 +2075,30 @@ bool GuiApp::Impl::start_decode() {
             dec_.capture = std::move(capture);
             dec_.H_initial = identity_scaled(dec_.source_w, dec_.source_h);
             dec_.H = dec_.H_initial.clone();
-            dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
-            dec_.detector = std::make_unique<DetectionWorker>(layout, key);
-            dec_.detector->start();
-            dec_.locked = false;
+            dec_.margin = margin_override_ >= 0 ? margin_override_
+                                                : adaptive_margin(dec_.H, layout.cell);
         }
 
-        dec_.decoder = std::move(decoder);
-        dec_.layout = layout;
-        dec_.key = key;
-
-        if (dec_.fullscreen) {
-            auto window = std::make_unique<OutputWindow>();
-            if (!window->init(device_.Get(), context_.Get(), layout.ref_w(),
-                              layout.ref_h(), L"OBScure Restored",
-                              resolve_shader_path(L"blit.hlsl"), &error)) {
-                return fail("独立预览窗口创建失败: " + error);
-            }
-            window->show();
-            window->set_bottom();
-            dec_.fullscreen_window = std::move(window);
+        if (margin_override_ < 0) {
+            dec_.margin = adaptive_margin(dec_.H, layout.cell);
         }
+        if (!create_decode_pipeline(layout, key, use_color, use_dihedral, &error)) {
+            return fail("解码器初始化失败: " + error);
+        }
+        const bool enable_detection =
+            dec_.source != DecodeState::Source::File || dec_.detect_file;
+        recreate_decode_detector(enable_detection);
+        dec_.locked = !enable_detection;
+
+        sync_decode_preview_window();
 
         dec_.stat_frames = 0;
         dec_.fps = 0.0;
         dec_.stat_start = Clock::now();
         dec_.running = true;
-        log_line("decode started");
+        log_line("decode started: preset=" + std::string(kPresets[preset_index_].id) +
+                 " color=" + (use_color ? "on" : "off") +
+                 " key=" + (public_mode_ ? "public" : "private"));
         return true;
     } catch (const std::exception& e) {
         set_error(std::string("启动解码失败: ") + e.what());
@@ -1992,6 +2125,11 @@ void GuiApp::Impl::stop_decode() {
     dec_.decoder.reset();
     dec_.fps = 0.0;
     dec_.stat_frames = 0;
+    dec_.video_meta.reset();
+    dec_.metadata_applied = false;
+    dec_.metadata_read_pending = false;
+    dec_.metadata_read_deadline = {};
+    dec_.key_ok = false;
 }
 
 bool GuiApp::Impl::read_source_bgr(cv::Mat& bgr) {
@@ -2011,27 +2149,240 @@ bool GuiApp::Impl::read_source_bgr(cv::Mat& bgr) {
     return true;
 }
 
+bool GuiApp::Impl::create_decode_pipeline(const Layout& layout, const KeyMaterial& key,
+                                          bool use_color, bool use_dihedral,
+                                          std::string* error) {
+    auto decoder = std::make_unique<DecodePipeline>();
+    if (!decoder->init(device_.Get(), context_.Get(), layout, key, use_color,
+                       use_dihedral, resolve_shader_path(L"decode.hlsl"), error)) {
+        return false;
+    }
+    const int margin = margin_override_ >= 0 ? margin_override_ : dec_.margin;
+    decoder->set_margin(std::max(0, margin));
+    dec_.decoder = std::move(decoder);
+    dec_.layout = layout;
+    dec_.key = key;
+    dec_.use_color = use_color;
+    dec_.use_dihedral = use_dihedral;
+    return true;
+}
+
+void GuiApp::Impl::recreate_decode_detector(bool enable) {
+    if (dec_.detector) {
+        dec_.detector->stop();
+        dec_.detector.reset();
+    }
+    dec_.detect_tick = 0;
+    if (!enable) return;
+    dec_.detector = std::make_unique<DetectionWorker>(dec_.layout, dec_.key);
+    dec_.detector->start();
+    cv::Mat seed;
+    if (dec_.source == DecodeState::Source::File && !dec_.last_file_frame.empty()) {
+        seed = dec_.last_file_frame;
+    } else if (!dec_.last_detect_frame.empty()) {
+        seed = dec_.last_detect_frame;
+    }
+    if (!seed.empty()) dec_.detector->submit(seed);
+}
+
+void GuiApp::Impl::sync_decode_preview_window() {
+    if (!dec_.fullscreen) {
+        if (dec_.fullscreen_window) {
+            dec_.fullscreen_window->shutdown();
+            dec_.fullscreen_window.reset();
+        }
+        return;
+    }
+    if (!dec_.decoder) return;
+    const int width = dec_.layout.ref_w();
+    const int height = dec_.layout.ref_h();
+    if (dec_.fullscreen_window && dec_.fullscreen_window->width() == width &&
+        dec_.fullscreen_window->height() == height) {
+        return;
+    }
+    auto window = std::make_unique<OutputWindow>();
+    std::string error;
+    if (!window->init(device_.Get(), context_.Get(), width, height, L"OBScure Restored",
+                      resolve_shader_path(L"blit.hlsl"), &error)) {
+        dec_.error = "独立预览窗口创建失败: " + error;
+        return;
+    }
+    window->show();
+    window->set_bottom();
+    dec_.fullscreen_window = std::move(window);
+}
+
+std::optional<Metadata> GuiApp::Impl::read_file_metadata() {
+    if (dec_.last_file_frame.empty()) return std::nullopt;
+    const cv::Mat H =
+        identity_scaled(dec_.last_file_frame.cols, dec_.last_file_frame.rows);
+    return decode_metadata(dec_.last_file_frame, H, dec_.layout);
+}
+
+bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
+    if (!force && !auto_match_settings_) return false;
+    auto target_layout = layout_from_metadata(metadata);
+    if (!target_layout) {
+        dec_.metadata_applied = true;
+        dec_.metadata_read_pending = false;
+        dec_.error = "视频元数据几何参数非法，已忽略。";
+        log_line("decode metadata rejected: invalid geometry");
+        return false;
+    }
+
+    const bool want_public = metadata.public_mode();
+    if (!want_public) {
+        const uint32_t current_id =
+            public_mode_ ? public_key_id() : key_id_from_text(key_buf_);
+        if (metadata.key_id != current_id) {
+            public_mode_ = false;
+            dec_.video_meta = metadata;
+            dec_.metadata_applied = true;
+            dec_.metadata_read_pending = false;
+            dec_.key_ok = false;
+            dec_.use_color = metadata.use_color();
+            dec_.use_dihedral = metadata.use_dihedral();
+            if (const auto* p = preset_by_id(metadata.preset_id)) {
+                const int idx = preset_index_by_id(p->id);
+                if (idx >= 0) preset_index_ = idx;
+            } else {
+                const int idx = preset_index_by_geometry(metadata.cell, metadata.guard,
+                                                         metadata.scale_x10);
+                if (idx >= 0) preset_index_ = idx;
+            }
+            char buf[160]{};
+            sprintf_s(buf, "密钥不匹配：视频 keyID %08X，当前 keyID %08X",
+                      metadata.key_id, current_id);
+            dec_.error = buf;
+            log_line(std::string("decode metadata key mismatch: ") + buf);
+            return false;
+        }
+    }
+
+    Layout layout = *target_layout;
+    if (margin_override_ < 0) {
+        dec_.margin = adaptive_margin(dec_.H, layout.cell);
+    }
+    layout.key = want_public ? std::string(kPublicKey) : std::string(key_buf_);
+    const KeyMaterial key = derive_key(layout);
+    std::string error;
+    if (!create_decode_pipeline(layout, key, metadata.use_color(),
+                                metadata.use_dihedral(), &error)) {
+        dec_.metadata_applied = true;
+        dec_.metadata_read_pending = false;
+        dec_.error = "应用视频设置失败: " + error;
+        return false;
+    }
+
+    public_mode_ = want_public;
+    if (const auto* p = preset_by_id(metadata.preset_id)) {
+        const int idx = preset_index_by_id(p->id);
+        if (idx >= 0) preset_index_ = idx;
+    } else {
+        const int idx = preset_index_by_geometry(metadata.cell, metadata.guard,
+                                                 metadata.scale_x10);
+        if (idx >= 0) preset_index_ = idx;
+    }
+
+    recreate_decode_detector(dec_.source != DecodeState::Source::File ||
+                             dec_.detect_file);
+    sync_decode_preview_window();
+    dec_.video_meta = metadata;
+    dec_.metadata_applied = true;
+    dec_.metadata_read_pending = false;
+    dec_.key_ok = true;
+    dec_.error.clear();
+    log_line("decode metadata applied: preset=" +
+             std::string(preset_by_id(metadata.preset_id)
+                             ? preset_by_id(metadata.preset_id)->id
+                             : "custom") +
+             " color=" + (metadata.use_color() ? "on" : "off") +
+             " key=" + (want_public ? "public" : "private"));
+    return true;
+}
+
+bool GuiApp::Impl::apply_manual_decode_settings() {
+    if (!dec_.running) return false;
+    if (!public_mode_ && key_buf_[0] == '\0') {
+        set_error("密钥不能为空。");
+        return false;
+    }
+    const Preset& preset = kPresets[preset_index_];
+    Layout layout;
+    layout.cell = preset.cell;
+    layout.guard = preset.guard;
+    layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
+    layout.validate();
+    if (margin_override_ < 0) {
+        dec_.margin = adaptive_margin(dec_.H, layout.cell);
+    }
+    const KeyMaterial key = derive_key(layout);
+    std::string error;
+    if (!create_decode_pipeline(layout, key, dec_.use_color, dec_.use_dihedral, &error)) {
+        set_error("应用设置失败: " + error);
+        return false;
+    }
+    recreate_decode_detector(dec_.source != DecodeState::Source::File ||
+                             dec_.detect_file);
+    sync_decode_preview_window();
+    dec_.metadata_applied = true;  // manual changes win over later detection
+    dec_.metadata_read_pending = false;
+    if (dec_.video_meta) {
+        dec_.key_ok = dec_.video_meta->public_mode()
+                          ? public_mode_
+                          : dec_.video_meta->key_id == key.key_id;
+    } else {
+        dec_.key_ok = true;
+    }
+    dec_.error.clear();
+    log_line("decode settings applied: preset=" + std::string(preset.id) +
+             " color=" + (dec_.use_color ? "on" : "off") +
+             " key=" + (public_mode_ ? "public" : "private"));
+    return true;
+}
+
+void GuiApp::Impl::request_video_settings() {
+    if (!dec_.running) return;
+    dec_.metadata_applied = false;
+    dec_.metadata_read_pending = true;
+    dec_.metadata_read_deadline = Clock::now() + std::chrono::seconds(3);
+    dec_.error.clear();
+
+    if (dec_.source == DecodeState::Source::File && !dec_.detect_file) {
+        dec_.metadata_read_pending = false;
+        if (auto metadata = read_file_metadata()) {
+            apply_video_metadata(*metadata, true);
+        } else {
+            dec_.error =
+                "未读到视频信息；如为播放器录屏，请勾选“播放器录屏（启用定位）”。";
+        }
+        return;
+    }
+
+    if (!dec_.detector) recreate_decode_detector(true);
+    dec_.detect_tick = dec_.source == DecodeState::Source::File ? 29 : 59;
+    log_line("decode metadata read requested");
+}
+
 void GuiApp::Impl::reset_decode_detection() {
     if (!dec_.running) return;
     dec_.H_initial = identity_scaled(dec_.source_w, dec_.source_h);
     dec_.H = dec_.H_initial.clone();
-    dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
+    dec_.margin = margin_override_ >= 0 ? margin_override_
+                                        : adaptive_margin(dec_.H, dec_.layout.cell);
     dec_.locked = false;
     dec_.markers = 0;
-    dec_.key_ok = false;
+    dec_.key_ok = dec_.video_meta
+                      ? (dec_.video_meta->public_mode()
+                             ? dec_.key.key_id == public_key_id()
+                             : dec_.video_meta->key_id == dec_.key.key_id)
+                      : false;
     dec_.detect_ms = 0.0;
-    dec_.detect_tick = 60;
+    dec_.detect_tick = dec_.source == DecodeState::Source::File ? 29 : 59;
     dec_.last_detect_frame.release();
     dec_.last_detect_log = {};
-    if (dec_.detector) {
-        dec_.detector->stop();
-        dec_.detector = std::make_unique<DetectionWorker>(dec_.layout, dec_.key);
-        dec_.detector->start();
-        if (dec_.source == DecodeState::Source::File && dec_.detect_file &&
-            !dec_.last_file_frame.empty()) {
-            dec_.detector->submit(dec_.last_file_frame);
-        }
-    }
+    recreate_decode_detector(dec_.source != DecodeState::Source::File ||
+                             dec_.detect_file);
     log_line("decode detection reset");
 }
 
@@ -2054,12 +2405,29 @@ void GuiApp::Impl::apply_detection(const DetectionOutcome& outcome) {
     }
     const bool snap = content_delta(dec_.H_initial, outcome.H, dec_.layout) < 2.0;
     dec_.H = snap ? dec_.H_initial.clone() : outcome.H;
-    const int auto_margin = snap ? adaptive_margin(dec_.H) : outcome.margin;
+    const int auto_margin = snap ? adaptive_margin(dec_.H, dec_.layout.cell)
+                                 : outcome.margin;
     dec_.margin = margin_override_ >= 0 ? margin_override_ : auto_margin;
-    dec_.key_ok = outcome.key_ok;
     dec_.markers = outcome.markers;
     dec_.detect_ms = outcome.ms;
     dec_.locked = true;
+
+    if (outcome.metadata) {
+        dec_.video_meta = outcome.metadata;
+        dec_.key_ok = outcome.metadata->public_mode()
+                          ? dec_.key.key_id == public_key_id()
+                          : outcome.metadata->key_id == dec_.key.key_id;
+        dec_.metadata_read_pending = false;
+        if (!dec_.metadata_applied) {
+            apply_video_metadata(*outcome.metadata, false);
+        }
+    } else {
+        dec_.key_ok = outcome.key_ok;
+        if (dec_.metadata_read_pending) {
+            dec_.metadata_read_pending = false;
+            dec_.error = "未读到视频信息（定位已锁定，但元数据条码不可读）。";
+        }
+    }
 }
 
 void GuiApp::Impl::update_decode() {
@@ -2101,6 +2469,13 @@ void GuiApp::Impl::update_decode() {
             reset_decode_detection();
         }
         if (dec_.source_tex) dec_.capture->copy_latest(dec_.source_tex.Get());
+    }
+
+    if (dec_.metadata_read_pending &&
+        dec_.metadata_read_deadline.time_since_epoch().count() != 0 &&
+        Clock::now() > dec_.metadata_read_deadline) {
+        dec_.metadata_read_pending = false;
+        dec_.error = "读取视频设置超时：未检测到可读的元数据。";
     }
 
     if (dec_.detector) {

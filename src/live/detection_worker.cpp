@@ -134,9 +134,16 @@ bool DetectionWorker::detect(const cv::Mat& bgr, const Layout& layout,
         return false;
     }
     out->H = best.H_orig;
-    out->margin = adaptive_margin(best.H_orig);
+    out->margin = adaptive_margin(best.H_orig, layout.cell);
     const auto metadata = decode_metadata(best.image, best.H_image, layout);
-    out->key_ok = metadata.has_value() && metadata->key_id == key.key_id;
+    out->metadata = metadata;
+    if (metadata.has_value()) {
+        out->key_ok = metadata->public_mode()
+                          ? key.key_id == public_key_id()
+                          : metadata->key_id == key.key_id;
+    } else {
+        out->key_ok = false;
+    }
     out->ok = true;
     return true;
 }

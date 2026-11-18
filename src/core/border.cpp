@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "core/metadata.h"
+#include "core/presets.h"
 
 namespace obs {
 
@@ -37,9 +38,7 @@ void draw_metadata_strip(cv::Mat& canvas, const std::vector<int>& bits, int x0, 
 cv::Mat build_border(
     const Layout& layout,
     const KeyMaterial& key,
-    bool use_color,
-    bool use_dihedral,
-    double extra_scale) {
+    const TransportOptions& options) {
     layout.validate();
     cv::Mat canvas(layout.canvas_h, layout.canvas_w, CV_8UC3, cv::Scalar(18, 18, 18));
 
@@ -59,8 +58,7 @@ cv::Mat build_border(
         box_bgr.copyTo(canvas(cv::Rect(p.x, p.y, kMarkerBox, kMarkerBox)));
     }
 
-    const auto bits = build_metadata_bits(
-        layout, key.key_id, 0, use_color, use_dihedral, extra_scale);
+    const auto bits = build_metadata_bits(layout, key.key_id, options);
     draw_metadata_strip(canvas, bits, kMetaX0, kMetaY0Top);
     draw_metadata_strip(canvas, bits, kMetaX0, kMetaY0Bottom);
 
@@ -80,8 +78,14 @@ cv::Mat build_border(
     }
 
     std::ostringstream label;
+    const char* preset_id = "custom";
+    if (const auto* preset = preset_by_id(options.preset_id)) {
+        preset_id = preset->id;
+    }
     label << "OBSCure v1  " << layout.content_w << "x" << layout.content_h
-          << "  cell " << layout.cell << " guard " << layout.guard << "  key "
+          << "  cell " << layout.cell << " guard " << layout.guard << "  "
+          << preset_id << "  color " << (options.use_color ? "on" : "off")
+          << "  " << (options.public_mode ? "public" : "key") << " "
           << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
           << key.key_id;
     cv::putText(canvas, label.str(), cv::Point(kMetaX0, 88),

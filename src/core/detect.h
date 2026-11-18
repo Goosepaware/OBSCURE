@@ -27,5 +27,6 @@ std::optional<Metadata> decode_metadata(const cv::Mat& transport, const cv::Mat&
                                         const Layout& layout);
 
 int adaptive_margin(const cv::Mat& H);
+int adaptive_margin(const cv::Mat& H, int cell);
 
 }  // namespace obs

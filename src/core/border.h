@@ -4,14 +4,13 @@
 
 #include "core/key.h"
 #include "core/layout.h"
+#include "core/metadata.h"
 
 namespace obs {
 
 cv::Mat build_border(
     const Layout& layout,
     const KeyMaterial& key,
-    bool use_color = true,
-    bool use_dihedral = true,
-    double extra_scale = 1.0);
+    const TransportOptions& options);
 
 }  // namespace obs

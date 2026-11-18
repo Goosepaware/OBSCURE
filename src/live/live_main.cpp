@@ -22,6 +22,8 @@
 #include "core/border.h"
 #include "core/key.h"
 #include "core/layout.h"
+#include "core/metadata.h"
+#include "core/presets.h"
 #include "core/transform.h"
 #include "live/d3d_helpers.h"
 #include "live/wgc_capture.h"
@@ -37,23 +39,6 @@ std::atomic<bool> g_running{true};
 BOOL WINAPI ctrl_handler(DWORD) {
     g_running.store(false);
     return TRUE;
-}
-
-struct Preset {
-    int cell;
-    int guard;
-    double scale;
-};
-
-const std::map<std::string, Preset>& presets() {
-    static const std::map<std::string, Preset> p = {
-        {"c32_g2_s100", {32, 2, 1.0}},
-        {"c32_g2_s120", {32, 2, 1.2}},
-        {"c32_g2_s140", {32, 2, 1.4}},
-        {"c16_g1_s100", {16, 1, 1.0}},
-        {"c16_g2_s100", {16, 2, 1.0}},
-    };
-    return p;
 }
 
 std::map<std::string, std::string> parse_args(int argc, char** argv) {
@@ -119,11 +104,13 @@ struct alignas(16) ShaderParams {
 };
 static_assert(sizeof(ShaderParams) == 64, "shader params must be 64 bytes");
 
-std::vector<uint32_t> build_lut(const obs::Layout& layout, const obs::KeyMaterial& key) {
+std::vector<uint32_t> build_lut(const obs::Layout& layout, const obs::KeyMaterial& key,
+                                bool use_color) {
     std::vector<uint32_t> lut(static_cast<size_t>(layout.blocks()));
     for (int d = 0; d < layout.blocks(); ++d) {
         const uint32_t b = static_cast<uint32_t>(key.perm[static_cast<size_t>(d)]);
-        const uint32_t color = key.color[static_cast<size_t>(d)] & 7u;
+        const uint32_t color =
+            use_color ? (key.color[static_cast<size_t>(d)] & 7u) : 0u;
         const uint32_t dih = key.dihedral[static_cast<size_t>(d)] & 7u;
         lut[static_cast<size_t>(d)] = b | (color << 16) | (dih << 19);
     }
@@ -175,9 +162,11 @@ int main(int argc, char** argv) {
             << "  --file PATH        use a video file as the source (loop)\n"
             << "  --seconds N        run for N seconds (0 = until Ctrl+C, default 20)\n"
             << "  --config NAME      c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
-            << "                     c16_g2_s100, c16_g1_s100\n"
+            << "                     c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
             << "  --spout NAME       Spout sender name (default OBScure)\n"
             << "  --key TEXT         shared key (default obscure-demo-key)\n"
+            << "  --public           use the built-in public key\n"
+            << "  --no-color         disable color scrambling\n"
             << "  --shader PATH      transport.hlsl path\n"
             << "  --fps N            output frame rate (default 60)\n";
         return 0;
@@ -187,19 +176,28 @@ int main(int argc, char** argv) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
         const std::string config = get(args, "config", "c32_g2_s120");
-        const auto pit = presets().find(config);
-        if (pit == presets().end()) {
+        const int preset_index = obs::preset_index_by_id(config);
+        if (preset_index < 0) {
             std::cerr << "unknown config: " << config << "\n";
             return 2;
         }
-        const Preset preset = pit->second;
+        const obs::Preset& preset = obs::kPresets[preset_index];
+        const bool public_key = args.find("public") != args.end();
+        const bool use_color = args.find("no-color") == args.end();
 
         obs::Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
-        layout.key = get(args, "key", "obscure-demo-key");
+        layout.key = public_key ? std::string(obs::kPublicKey)
+                                : get(args, "key", "obscure-demo-key");
         layout.validate();
         const obs::KeyMaterial key = obs::derive_key(layout);
+        obs::TransportOptions options;
+        options.use_color = use_color;
+        options.use_dihedral = true;
+        options.public_mode = public_key;
+        options.preset_id = preset_index + 1;
+        options.scale_x10 = obs::preset_scale_x10(preset);
 
         ComPtr<ID3D11Device> device;
         ComPtr<ID3D11DeviceContext> context;
@@ -232,7 +230,7 @@ int main(int argc, char** argv) {
         }
 
         // Border texture (markers, metadata, calibration) generated once.
-        const cv::Mat border = obs::build_border(layout, key, true, true, preset.scale);
+        const cv::Mat border = obs::build_border(layout, key, options);
         cv::Mat border_bgra;
         cv::cvtColor(border, border_bgra, cv::COLOR_BGR2BGRA);
         auto border_tex = obs::create_texture(
@@ -246,7 +244,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        const auto lut = build_lut(layout, key);
+        const auto lut = build_lut(layout, key, use_color);
         const auto table = build_src_from_dst(layout);
         auto lut_buf = obs::create_structured_buffer(
             device.Get(), lut.size() * sizeof(uint32_t), sizeof(uint32_t), lut.data());

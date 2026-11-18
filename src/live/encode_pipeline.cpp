@@ -34,12 +34,15 @@ struct alignas(16) ShaderParams {
 };
 static_assert(sizeof(ShaderParams) == 64, "shader params must be 64 bytes");
 
-std::vector<uint32_t> build_lut(const Layout& layout, const KeyMaterial& key) {
+std::vector<uint32_t> build_lut(const Layout& layout, const KeyMaterial& key,
+                                const TransportOptions& options) {
     std::vector<uint32_t> lut(static_cast<size_t>(layout.blocks()));
     for (int d = 0; d < layout.blocks(); ++d) {
         const uint32_t b = static_cast<uint32_t>(key.perm[static_cast<size_t>(d)]);
-        const uint32_t color = key.color[static_cast<size_t>(d)] & 7u;
-        const uint32_t dih = key.dihedral[static_cast<size_t>(d)] & 7u;
+        const uint32_t color =
+            options.use_color ? (key.color[static_cast<size_t>(d)] & 7u) : 0u;
+        const uint32_t dih =
+            options.use_dihedral ? (key.dihedral[static_cast<size_t>(d)] & 7u) : 0u;
         lut[static_cast<size_t>(d)] = b | (color << 16) | (dih << 19);
     }
     return lut;
@@ -71,11 +74,13 @@ std::vector<uint32_t> build_src_from_dst(const Layout& layout) {
 
 bool EncodePipeline::init(ID3D11Device* device, ID3D11DeviceContext* context,
                           const Layout& layout, const KeyMaterial& key, double extra_scale,
+                          const TransportOptions& options,
                           const std::wstring& shader_path, std::string* error) {
     device_ = device;
     context_ = context;
     layout_ = layout;
     extra_scale_ = extra_scale;
+    options_ = options;
 
     auto vs_blob = compile_shader(shader_path, "VSMain", "vs_5_0", error);
     auto ps_blob = compile_shader(shader_path, "PSMain", "ps_5_0", error);
@@ -91,7 +96,7 @@ bool EncodePipeline::init(ID3D11Device* device, ID3D11DeviceContext* context,
         return false;
     }
 
-    const cv::Mat border = build_border(layout_, key, true, true, extra_scale_);
+    const cv::Mat border = build_border(layout_, key, options_);
     cv::Mat border_bgra;
     cv::cvtColor(border, border_bgra, cv::COLOR_BGR2BGRA);
     auto border_tex = create_texture(
@@ -108,7 +113,7 @@ bool EncodePipeline::init(ID3D11Device* device, ID3D11DeviceContext* context,
         return false;
     }
 
-    const auto lut = build_lut(layout_, key);
+    const auto lut = build_lut(layout_, key, options_);
     const auto table = build_src_from_dst(layout_);
     auto lut_buf = create_structured_buffer(device, lut.size() * sizeof(uint32_t),
                                             sizeof(uint32_t), lut.data());

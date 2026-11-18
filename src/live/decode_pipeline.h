@@ -17,7 +17,8 @@ namespace obs {
 class DecodePipeline {
 public:
     bool init(ID3D11Device* device, ID3D11DeviceContext* context, const Layout& layout,
-              const KeyMaterial& key, const std::wstring& shader_path, std::string* error);
+              const KeyMaterial& key, bool use_color, bool use_dihedral,
+              const std::wstring& shader_path, std::string* error);
     void set_margin(int margin);
     void render(ID3D11ShaderResourceView* capture, int capture_w, int capture_h,
                 const cv::Mat& H);
@@ -26,6 +27,8 @@ public:
     ID3D11ShaderResourceView* restored_srv() const { return restored_srv_.Get(); }
     const Layout& layout() const { return layout_; }
     int margin() const { return margin_; }
+    bool use_color() const { return use_color_; }
+    bool use_dihedral() const { return use_dihedral_; }
 
 private:
     struct MapEntry {
@@ -35,6 +38,8 @@ private:
 
     Layout layout_;
     int margin_ = 0;
+    bool use_color_ = true;
+    bool use_dihedral_ = true;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;

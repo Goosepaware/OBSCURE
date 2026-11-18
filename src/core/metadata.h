@@ -8,6 +8,14 @@
 
 namespace obs {
 
+struct TransportOptions {
+    bool use_color = true;
+    bool use_dihedral = true;
+    bool public_mode = false;
+    int preset_id = 0;   // 1-based stable preset id, 0 = custom/unknown
+    int scale_x10 = 0;   // 0 = unknown, otherwise 10/12/14...
+};
+
 struct Metadata {
     int version = 0;
     int canvas_w = 0;
@@ -23,8 +31,14 @@ struct Metadata {
     uint32_t key_id = 0;
     int flags = 0;
     int inner = 0;
-    int reserved = 0;
+    int preset_id = 0;
+    int scale_x10 = 0;
     uint16_t crc = 0;
+
+    bool use_color() const { return (flags & 0x01) != 0; }
+    bool use_dihedral() const { return (flags & 0x02) != 0; }
+    bool extra_scaled() const { return (flags & 0x04) != 0; }
+    bool public_mode() const { return (flags & 0x08) != 0; }
 };
 
 uint16_t crc16_ccitt(const uint8_t* data, size_t size);
@@ -32,11 +46,12 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t size);
 std::vector<int> build_metadata_bits(
     const Layout& layout,
     uint32_t key_id,
-    int flags,
-    bool use_color,
-    bool use_dihedral,
-    double extra_scale);
+    const TransportOptions& options);
 
 std::optional<Metadata> parse_metadata(const std::vector<int>& bits);
+
+// Rebuild the transport geometry described by validated metadata. The caller
+// is responsible for choosing the key text.
+std::optional<Layout> layout_from_metadata(const Metadata& metadata);
 
 }  // namespace obs

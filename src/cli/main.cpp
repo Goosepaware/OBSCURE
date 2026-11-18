@@ -17,31 +17,13 @@
 #include "core/key.h"
 #include "core/layout.h"
 #include "core/metadata.h"
+#include "core/presets.h"
 #include "core/transform.h"
 #include "io/ffmpeg_writer.h"
 
 namespace fs = std::filesystem;
 
 namespace {
-
-struct Preset {
-    int cell;
-    int guard;
-    double scale;
-};
-
-const std::map<std::string, Preset>& presets() {
-    static const std::map<std::string, Preset> p = {
-        {"c32_g2_s100", {32, 2, 1.0}},
-        {"c32_g2_s120", {32, 2, 1.2}},
-        {"c32_g2_s140", {32, 2, 1.4}},
-        {"c16_g1_s100", {16, 1, 1.0}},
-        {"c16_g2_s100", {16, 2, 1.0}},
-        {"c64_g2_s100", {64, 2, 1.0}},
-        {"c64_g2_s120", {64, 2, 1.2}},
-    };
-    return p;
-}
 
 void usage() {
     std::cout
@@ -54,6 +36,8 @@ void usage() {
         << "                       c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
         << "  --bitrate N          encode CBR Mbps (default 8)\n"
         << "  --key TEXT           shared key (default obscure-demo-key)\n"
+        << "  --public             use the built-in public key (no secret needed)\n"
+        << "  --no-color           disable color scrambling (keep original colors)\n"
         << "  --frames N           process at most N frames (0 = all)\n"
         << "  --start SEC          seek before reading\n"
         << "  --ffmpeg PATH        ffmpeg executable\n"
@@ -119,7 +103,12 @@ int run_selftest() {
         layout.key = "obscure-selftest";
         layout.validate();
         const obs::KeyMaterial key = obs::derive_key(layout);
-        const cv::Mat border = obs::build_border(layout, key, true, true, 1.0);
+        obs::TransportOptions options;
+        options.use_color = true;
+        options.use_dihedral = true;
+        options.preset_id = 2;
+        options.scale_x10 = 12;
+        const cv::Mat border = obs::build_border(layout, key, options);
 
         cv::Mat source(layout.canvas_h, layout.canvas_w, CV_8UC3);
         cv::randu(source, cv::Scalar(0, 0, 0), cv::Scalar(255, 255, 255));
@@ -165,13 +154,49 @@ int run_selftest() {
         }
 
         const bool markers_ok = det.marker_count == 4 && !det.H.empty();
-        const bool meta_ok = meta.has_value() && meta->key_id == key.key_id;
+        const bool meta_ok = meta.has_value() && meta->key_id == key.key_id &&
+                             !meta->public_mode() && meta->use_color() &&
+                             meta->preset_id == 2 && meta->scale_x10 == 12;
         const bool exact = max_diff == 0.0;
+
+        // Public + color-disabled round trip and metadata flags.
+        obs::Layout public_layout = layout;
+        public_layout.key = obs::kPublicKey;
+        const obs::KeyMaterial public_key = obs::derive_key(public_layout);
+        obs::TransportOptions public_options;
+        public_options.use_color = false;
+        public_options.use_dihedral = true;
+        public_options.public_mode = true;
+        public_options.preset_id = 6;
+        public_options.scale_x10 = 10;
+        const cv::Mat public_border =
+            obs::build_border(public_layout, public_key, public_options);
+        const cv::Mat public_content = obs::obfuscate_content(
+            source, public_layout, public_key, 1.0, false, true);
+        const cv::Mat public_transport =
+            obs::compose_transport(public_content, public_border, public_layout);
+        const cv::Mat public_reference =
+            obs::make_reference(source, public_layout, 1.0);
+        const cv::Mat public_restored = obs::deobfuscate_content(
+            obs::crop_content(public_transport, public_layout), public_layout,
+            public_key, false, true, 0);
+        const double public_diff =
+            cv::norm(public_restored, public_reference, cv::NORM_INF);
+        const auto public_det = obs::detect_homography(public_transport);
+        const auto public_meta =
+            obs::decode_metadata(public_transport, public_det.H, public_layout);
+        const bool public_ok =
+            public_diff == 0.0 && public_meta.has_value() &&
+            public_meta->public_mode() && !public_meta->use_color() &&
+            public_meta->preset_id == 6 && public_meta->scale_x10 == 10 &&
+            public_meta->key_id == public_key.key_id;
+
         std::cout << "selftest: exact=" << exact << " maxdiff=" << max_diff
                   << " markers=" << det.marker_count << " h_err=" << det.reproj_error
-                  << " metadata=" << meta_ok
+                  << " metadata=" << meta_ok << " public=" << public_ok
                   << " dihedral=" << dihedral_ok << " color=" << color_ok << "\n";
-        const bool ok = exact && markers_ok && meta_ok && dihedral_ok && color_ok;
+        const bool ok =
+            exact && markers_ok && meta_ok && public_ok && dihedral_ok && color_ok;
         std::cout << (ok ? "SELFTEST OK" : "SELFTEST FAILED") << "\n";
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
@@ -204,7 +229,10 @@ int main(int argc, char** argv) {
     const std::string input = get(args, "input", "");
     const std::string output = get(args, "output", "");
     const std::string config = get(args, "config", "c32_g2_s120");
-    const std::string key_text = get(args, "key", "obscure-demo-key");
+    const bool public_key = args.find("public") != args.end();
+    const bool use_color = args.find("no-color") == args.end();
+    const std::string key_text =
+        public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
     const std::string ffmpeg = get(args, "ffmpeg", default_ffmpeg());
     const int max_frames = get_int(args, "frames", 0);
     const double start_sec = get_double(args, "start", 0.0);
@@ -222,11 +250,11 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const auto pit = presets().find(config);
-        if (pit == presets().end()) {
+        const int preset_index = obs::preset_index_by_id(config);
+        if (preset_index < 0) {
             throw std::runtime_error("unknown config: " + config);
         }
-        const Preset preset = pit->second;
+        const obs::Preset& preset = obs::kPresets[preset_index];
 
         obs::Layout layout;
         layout.cell = preset.cell;
@@ -234,15 +262,21 @@ int main(int argc, char** argv) {
         layout.key = key_text;
         layout.validate();
         const obs::KeyMaterial key = obs::derive_key(layout);
-        const cv::Mat border =
-            obs::build_border(layout, key, true, true, preset.scale);
+        obs::TransportOptions options;
+        options.use_color = use_color;
+        options.use_dihedral = true;
+        options.public_mode = public_key;
+        options.preset_id = preset_index + 1;
+        options.scale_x10 = obs::preset_scale_x10(preset);
+        const cv::Mat border = obs::build_border(layout, key, options);
 
         std::cout << "[config] " << config << " cell=" << layout.cell
                   << " guard=" << layout.guard << " scale=" << preset.scale
                   << " grid=" << layout.cols() << "x" << layout.rows()
                   << " ref=" << layout.ref_w() << "x" << layout.ref_h()
                   << " key=" << std::hex << std::uppercase << key.key_id << std::dec
-                  << "\n";
+                  << " color=" << (use_color ? 1 : 0)
+                  << " public=" << (public_key ? 1 : 0) << "\n";
 
         cv::VideoCapture cap;
         bool opened = cap.open(input, cv::CAP_MSMF);
@@ -282,6 +316,7 @@ int main(int argc, char** argv) {
         int margin_sum = 0;
         cv::Mat H;
         bool key_warned = false;
+        bool meta_logged = false;
         const auto t0 = std::chrono::steady_clock::now();
 
         while (max_frames <= 0 || frames < max_frames) {
@@ -290,7 +325,8 @@ int main(int argc, char** argv) {
 
             if (mode == "encode") {
                 cv::Mat content =
-                    obs::obfuscate_content(frame, layout, key, preset.scale, true, true);
+                    obs::obfuscate_content(frame, layout, key, preset.scale,
+                                           use_color, true);
                 cv::Mat transport = obs::compose_transport(content, border, layout);
                 if (write_output && !writer.write(transport)) {
                     throw std::runtime_error(writer.error());
@@ -313,13 +349,28 @@ int main(int argc, char** argv) {
                     if (!H.empty() && frames % 60 == 0) {
                         const auto md = obs::decode_metadata(frame, H, layout);
                         ++meta_attempts;
-                        if (md && md->key_id == key.key_id) {
-                            ++meta_ok;
-                        } else if (md && md->key_id != key.key_id && !key_warned) {
-                            std::cerr << "[warn] metadata key id " << std::hex
-                                      << md->key_id << " != " << key.key_id << std::dec
-                                      << "\n";
-                            key_warned = true;
+                        if (md) {
+                            if (!meta_logged) {
+                                meta_logged = true;
+                                std::cout << "[meta] key=" << std::hex
+                                          << std::uppercase << md->key_id << std::dec
+                                          << " public=" << (md->public_mode() ? 1 : 0)
+                                          << " color=" << (md->use_color() ? 1 : 0)
+                                          << " dihedral="
+                                          << (md->use_dihedral() ? 1 : 0)
+                                          << " preset=" << md->preset_id
+                                          << " scale_x10=" << md->scale_x10
+                                          << " cell=" << md->cell
+                                          << " guard=" << md->guard << "\n";
+                            }
+                            if (md->key_id == key.key_id) {
+                                ++meta_ok;
+                            } else if (!key_warned) {
+                                std::cerr << "[warn] metadata key id " << std::hex
+                                          << md->key_id << " != " << key.key_id
+                                          << std::dec << "\n";
+                                key_warned = true;
+                            }
                         }
                     }
                 }
@@ -327,7 +378,7 @@ int main(int argc, char** argv) {
                 int margin = 0;
                 const std::string m = get(args, "margin", "auto");
                 if (m == "auto") {
-                    margin = obs::adaptive_margin(H);
+                    margin = obs::adaptive_margin(H, layout.cell);
                 } else {
                     margin = std::stoi(m);
                 }
@@ -335,7 +386,8 @@ int main(int argc, char** argv) {
 
                 cv::Mat canonical = obs::warp_to_canonical(frame, H, layout);
                 cv::Mat restored = obs::deobfuscate_content(
-                    obs::crop_content(canonical, layout), layout, key, true, true, margin);
+                    obs::crop_content(canonical, layout), layout, key, use_color, true,
+                    margin);
                 if (write_output && !writer.write(restored)) {
                     throw std::runtime_error(writer.error());
                 }

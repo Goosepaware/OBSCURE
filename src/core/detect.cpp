@@ -172,6 +172,10 @@ std::optional<Metadata> decode_metadata(const cv::Mat& transport, const cv::Mat&
 }
 
 int adaptive_margin(const cv::Mat& H) {
+    return adaptive_margin(H, 0);
+}
+
+int adaptive_margin(const cv::Mat& H, int cell) {
     if (H.empty() || H.rows < 2 || H.cols < 2) return 0;
     const double a = H.at<double>(0, 0);
     const double b = H.at<double>(0, 1);
@@ -179,7 +183,9 @@ int adaptive_margin(const cv::Mat& H) {
     const double d = H.at<double>(1, 1);
     const double scale = std::sqrt(std::abs(a * d - b * c));
     if (scale > 1.005) return 1;  // any upscaled capture: inset to avoid cell-edge bleed
-    if (scale >= 0.95) return 0;
+    // 64px cells at 1:1 still pick up the dark guard band through video
+    // compression; one pixel of inset removes the visible grid.
+    if (scale >= 0.95) return cell >= 64 ? 1 : 0;
     if (scale >= 0.65) return 1;
     return 2;
 }

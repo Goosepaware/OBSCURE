@@ -56,12 +56,15 @@ std::vector<uint32_t> build_src_from_dst(const Layout& layout) {
     return table;
 }
 
-std::vector<uint32_t> build_dec_lut(const Layout& layout, const KeyMaterial& key) {
+std::vector<uint32_t> build_dec_lut(const Layout& layout, const KeyMaterial& key,
+                                    bool use_color, bool use_dihedral) {
     std::vector<uint32_t> lut(static_cast<size_t>(layout.blocks()), 0);
     for (int d = 0; d < layout.blocks(); ++d) {
         const int b = key.perm[static_cast<size_t>(d)];
-        const uint32_t color = key.color[static_cast<size_t>(d)] & 7u;
-        const uint32_t dih = key.dihedral[static_cast<size_t>(d)] & 7u;
+        const uint32_t color =
+            use_color ? (key.color[static_cast<size_t>(d)] & 7u) : 0u;
+        const uint32_t dih =
+            use_dihedral ? (key.dihedral[static_cast<size_t>(d)] & 7u) : 0u;
         lut[static_cast<size_t>(b)] =
             static_cast<uint32_t>(d) | (color << 16) | (dih << 19);
     }
@@ -106,11 +109,14 @@ std::vector<std::pair<float, float>> build_decode_map(const Layout& layout, int 
 
 bool DecodePipeline::init(ID3D11Device* device, ID3D11DeviceContext* context,
                           const Layout& layout, const KeyMaterial& key,
+                          bool use_color, bool use_dihedral,
                           const std::wstring& shader_path, std::string* error) {
     device_ = device;
     context_ = context;
     layout_ = layout;
     margin_ = -1;
+    use_color_ = use_color;
+    use_dihedral_ = use_dihedral;
 
     auto vs_blob = compile_shader(shader_path, "VSMain", "vs_5_0", error);
     auto ps_blob = compile_shader(shader_path, "PSDecode", "ps_5_0", error);
@@ -125,7 +131,7 @@ bool DecodePipeline::init(ID3D11Device* device, ID3D11DeviceContext* context,
         return false;
     }
 
-    const auto lut = build_dec_lut(layout_, key);
+    const auto lut = build_dec_lut(layout_, key, use_color_, use_dihedral_);
     auto lut_buf = create_structured_buffer(device, lut.size() * sizeof(uint32_t),
                                             sizeof(uint32_t), lut.data());
     if (!lut_buf) {
@@ -218,8 +224,8 @@ void DecodePipeline::render(ID3D11ShaderResourceView* capture, int capture_w,
     params.captureW = static_cast<uint32_t>(capture_w);
     params.captureH = static_cast<uint32_t>(capture_h);
     params.margin = static_cast<float>(margin_);
-    params.useColor = 1;
-    params.useDih = 1;
+    params.useColor = use_color_ ? 1u : 0u;
+    params.useDih = use_dihedral_ ? 1u : 0u;
     params.H0[0] = static_cast<float>(H.at<double>(0, 0));
     params.H0[1] = static_cast<float>(H.at<double>(0, 1));
     params.H0[2] = static_cast<float>(H.at<double>(0, 2));

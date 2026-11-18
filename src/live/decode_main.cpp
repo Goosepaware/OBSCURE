@@ -30,6 +30,8 @@
 #include "core/detect.h"
 #include "core/key.h"
 #include "core/layout.h"
+#include "core/metadata.h"
+#include "core/presets.h"
 #include "core/transform.h"
 #include "live/d3d_helpers.h"
 #include "live/wgc_capture.h"
@@ -54,24 +56,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         default:
             return DefWindowProcW(hwnd, msg, wp, lp);
     }
-}
-
-struct Preset {
-    int cell;
-    int guard;
-};
-
-const std::map<std::string, Preset>& presets() {
-    static const std::map<std::string, Preset> p = {
-        {"c32_g2_s100", {32, 2}},
-        {"c32_g2_s120", {32, 2}},
-        {"c32_g2_s140", {32, 2}},
-        {"c16_g1_s100", {16, 1}},
-        {"c16_g2_s100", {16, 2}},
-        {"c64_g2_s100", {64, 2}},
-        {"c64_g2_s120", {64, 2}},
-    };
-    return p;
 }
 
 std::map<std::string, std::string> parse_args(int argc, char** argv) {
@@ -191,11 +175,12 @@ std::vector<uint32_t> build_src_from_dst(const obs::Layout& layout) {
 }
 
 std::vector<uint32_t> build_dec_lut(const obs::Layout& layout,
-                                    const obs::KeyMaterial& key) {
+                                    const obs::KeyMaterial& key, bool use_color) {
     std::vector<uint32_t> lut(static_cast<size_t>(layout.blocks()), 0);
     for (int d = 0; d < layout.blocks(); ++d) {
         const int b = key.perm[static_cast<size_t>(d)];
-        const uint32_t color = key.color[static_cast<size_t>(d)] & 7u;
+        const uint32_t color =
+            use_color ? (key.color[static_cast<size_t>(d)] & 7u) : 0u;
         const uint32_t dih = key.dihedral[static_cast<size_t>(d)] & 7u;
         lut[static_cast<size_t>(b)] =
             static_cast<uint32_t>(d) | (color << 16) | (dih << 19);
@@ -263,7 +248,7 @@ bool run_detection(const cv::Mat& bgr, const obs::Layout& layout,
     if (res.H.empty()) return false;
     cv::Mat scale = (cv::Mat_<double>(3, 3) << sx, 0, 0, 0, sy, 0, 0, 0, 1);
     *H_full = scale * res.H;
-    *margin = obs::adaptive_margin(*H_full);
+    *margin = obs::adaptive_margin(*H_full, layout.cell);
     *markers = res.marker_count;
 
     const auto md = obs::decode_metadata(det, res.H, layout);
@@ -409,6 +394,8 @@ int main(int argc, char** argv) {
             << "  --config NAME      c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
             << "                     c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
             << "  --key TEXT         shared key (default obscure-demo-key)\n"
+            << "  --public           use the built-in public key\n"
+            << "  --no-color         decode a transport that used --no-color\n"
             << "  --shader PATH      decode.hlsl path\n"
             << "  --margin auto|0|1|2 decoder inset (default auto)\n"
             << "  --detect           force marker detection in file mode\n"
@@ -422,15 +409,19 @@ int main(int argc, char** argv) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
         const std::string config = get(args, "config", "c32_g2_s120");
-        const auto pit = presets().find(config);
-        if (pit == presets().end()) {
+        const int preset_index = obs::preset_index_by_id(config);
+        if (preset_index < 0) {
             std::cerr << "unknown config\n";
             return 2;
         }
+        const obs::Preset& preset = obs::kPresets[preset_index];
+        const bool public_key = args.find("public") != args.end();
+        const bool use_color = args.find("no-color") == args.end();
         obs::Layout layout;
-        layout.cell = pit->second.cell;
-        layout.guard = pit->second.guard;
-        layout.key = get(args, "key", "obscure-demo-key");
+        layout.cell = preset.cell;
+        layout.guard = preset.guard;
+        layout.key = public_key ? std::string(obs::kPublicKey)
+                                : get(args, "key", "obscure-demo-key");
         layout.validate();
         const obs::KeyMaterial key = obs::derive_key(layout);
 
@@ -551,8 +542,8 @@ int main(int argc, char** argv) {
         params.refW = static_cast<uint32_t>(ref_w);
         params.refH = static_cast<uint32_t>(ref_h);
         params.margin = 0.0f;
-        params.useColor = 1;
-        params.useDih = 1;
+        params.useColor = use_color ? 1u : 0u;
+        params.useDih = 1u;
 
         D3D11_BUFFER_DESC cb_desc{};
         cb_desc.ByteWidth = sizeof(DecodeParams);
@@ -562,7 +553,7 @@ int main(int argc, char** argv) {
         ComPtr<ID3D11Buffer> cb;
         device->CreateBuffer(&cb_desc, nullptr, cb.GetAddressOf());
 
-        const auto dec_lut = build_dec_lut(layout, key);
+        const auto dec_lut = build_dec_lut(layout, key, use_color);
         auto lut_buf = obs::create_structured_buffer(
             device.Get(), dec_lut.size() * sizeof(uint32_t), sizeof(uint32_t),
             dec_lut.data());
@@ -705,7 +696,7 @@ int main(int argc, char** argv) {
         cv::Mat H;
         set_identity_scaled(&H, source_w, source_h);
         cv::Mat H_initial = H.clone();
-        int margin = obs::adaptive_margin(H);
+        int margin = obs::adaptive_margin(H, layout.cell);
         const std::string margin_arg = get(args, "margin", "auto");
         const bool auto_margin = margin_arg == "auto";
         if (!auto_margin) margin = std::stoi(margin_arg);
@@ -737,6 +728,8 @@ int main(int argc, char** argv) {
 
         std::cout << "[decode] config=" << config << " ref=" << ref_w << "x" << ref_h
                   << " key=" << std::hex << std::uppercase << key.key_id << std::dec
+                  << " color=" << (use_color ? 1 : 0)
+                  << " public=" << (public_key ? 1 : 0)
                   << " margin=" << margin << "\n";
 
         D3D11_VIEWPORT vp{};
@@ -843,7 +836,8 @@ int main(int argc, char** argv) {
                     }
                     H = snap ? H_initial.clone() : outcome.H;
                     if (auto_margin) {
-                        margin = snap ? obs::adaptive_margin(H) : outcome.margin;
+                        margin = snap ? obs::adaptive_margin(H, layout.cell)
+                                      : outcome.margin;
                     }
                     key_ok = outcome.key_ok;
                     marker_count = outcome.markers;

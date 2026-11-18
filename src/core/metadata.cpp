@@ -1,5 +1,6 @@
 #include "core/metadata.h"
 
+#include <algorithm>
 #include <cassert>
 
 namespace obs {
@@ -45,6 +46,25 @@ uint32_t read_bits(const std::vector<int>& bits, size_t& pos, int width) {
     return v;
 }
 
+bool valid_geometry(const Metadata& m) {
+    if (m.canvas_w < 320 || m.canvas_w > 4096) return false;
+    if (m.canvas_h < 180 || m.canvas_h > 2304) return false;
+    if (m.content_w <= 0 || m.content_h <= 0) return false;
+    if (m.content_x < 0 || m.content_y < 0) return false;
+    if (m.content_x + m.content_w > m.canvas_w) return false;
+    if (m.content_y + m.content_h > m.canvas_h) return false;
+    if (m.cell < 8 || m.cell > 128) return false;
+    if (m.guard < 0 || m.guard > 8) return false;
+    if (m.cell - 2 * m.guard < 8) return false;
+    if (m.content_w % m.cell != 0 || m.content_h % m.cell != 0) return false;
+    if (m.cols <= 0 || m.rows <= 0) return false;
+    if (m.cols != m.content_w / m.cell || m.rows != m.content_h / m.cell) {
+        return false;
+    }
+    if (m.inner != m.cell - 2 * m.guard) return false;
+    return true;
+}
+
 }  // namespace
 
 uint16_t crc16_ccitt(const uint8_t* data, size_t size) {
@@ -65,14 +85,12 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t size) {
 std::vector<int> build_metadata_bits(
     const Layout& layout,
     uint32_t key_id,
-    int flags,
-    bool use_color,
-    bool use_dihedral,
-    double extra_scale) {
-    flags &= 0xFF;
-    if (use_color) flags |= 0x01;
-    if (use_dihedral) flags |= 0x02;
-    if (extra_scale > 1.0 + 1e-6) flags |= 0x04;
+    const TransportOptions& options) {
+    int flags = 0;
+    if (options.use_color) flags |= 0x01;
+    if (options.use_dihedral) flags |= 0x02;
+    if (options.scale_x10 > 10) flags |= 0x04;
+    if (options.public_mode) flags |= 0x08;
 
     BitWriter bw;
     bw.write(0xB5C3, 16);
@@ -90,7 +108,8 @@ std::vector<int> build_metadata_bits(
     bw.write(key_id, 32);
     bw.write(static_cast<uint32_t>(flags), 8);
     bw.write(static_cast<uint32_t>(layout.inner()), 8);
-    bw.write(0, 16);  // reserved
+    bw.write(static_cast<uint32_t>(std::clamp(options.preset_id, 0, 255)), 8);
+    bw.write(static_cast<uint32_t>(std::clamp(options.scale_x10, 0, 255)), 8);
 
     const auto payload = bw.bytes();
     assert(payload.size() == 24);
@@ -131,10 +150,14 @@ std::optional<Metadata> parse_metadata(const std::vector<int>& bits) {
     m.key_id = read_bits(bits, pos, 32);
     m.flags = static_cast<int>(read_bits(bits, pos, 8));
     m.inner = static_cast<int>(read_bits(bits, pos, 8));
-    m.reserved = static_cast<int>(read_bits(bits, pos, 16));
+    m.preset_id = static_cast<int>(read_bits(bits, pos, 8));
+    m.scale_x10 = static_cast<int>(read_bits(bits, pos, 8));
     m.crc = static_cast<uint16_t>(read_bits(bits, pos, 16));
 
     if (magic != 0xB5C3 || m.version != 1) {
+        return std::nullopt;
+    }
+    if (!valid_geometry(m)) {
         return std::nullopt;
     }
 
@@ -150,6 +173,20 @@ std::optional<Metadata> parse_metadata(const std::vector<int>& bits) {
         return std::nullopt;
     }
     return m;
+}
+
+std::optional<Layout> layout_from_metadata(const Metadata& metadata) {
+    if (!valid_geometry(metadata)) return std::nullopt;
+    Layout layout;
+    layout.canvas_w = metadata.canvas_w;
+    layout.canvas_h = metadata.canvas_h;
+    layout.content_x = metadata.content_x;
+    layout.content_y = metadata.content_y;
+    layout.content_w = metadata.content_w;
+    layout.content_h = metadata.content_h;
+    layout.cell = metadata.cell;
+    layout.guard = metadata.guard;
+    return layout;
 }
 
 }  // namespace obs
