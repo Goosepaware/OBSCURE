@@ -94,6 +94,8 @@ constexpr Preset kPresets[] = {
     {"c32_g2_s140", "隐私 32px / 1.4x", 32, 2, 1.4, 6},
     {"c16_g2_s100", "强隐私 16px / 2px", 16, 2, 1.0, 10},
     {"c16_g1_s100", "强隐私 16px / 1px", 16, 1, 1.0, 10},
+    {"c64_g2_s100", "画质优先 64px / 1.0x", 64, 2, 1.0, 12},
+    {"c64_g2_s120", "画质优先 64px / 1.2x", 64, 2, 1.2, 12},
 };
 constexpr int kPresetCount = static_cast<int>(std::size(kPresets));
 
@@ -205,6 +207,7 @@ struct GuiApp::Impl {
         uint64_t stat_frames = 0;
         double fps = 0.0;
         Clock::time_point stat_start{};
+        Clock::time_point last_file_log{};
         Layout layout;
         KeyMaterial key;
     };
@@ -240,12 +243,16 @@ struct GuiApp::Impl {
         int markers = 0;
         double detect_ms = 0.0;
         int detect_tick = 0;
+        cv::Mat last_detect_frame;
+        Clock::time_point last_fail_dump{};
+        Clock::time_point last_detect_log{};
         std::unique_ptr<OutputWindow> fullscreen_window;
         std::string error;
         bool show_capture = false;
         uint64_t stat_frames = 0;
         double fps = 0.0;
         Clock::time_point stat_start{};
+        Clock::time_point last_file_log{};
         Layout layout;
         KeyMaterial key;
     };
@@ -268,6 +275,7 @@ struct GuiApp::Impl {
     Mode mode_ = Mode::Encode;
     char key_buf_[128] = "obscure-demo-key";
     int preset_index_ = 1;
+int record_bitrate_ = 8;
     EncodeState enc_;
     DecodeState dec_;
     std::vector<MonitorInfo> monitors_;
@@ -459,6 +467,11 @@ void GuiApp::Impl::parse_command_line() {
             auto_decode_ = true;
         } else if (arg == L"--detect") {
             auto_detect_ = true;
+        } else if (arg == L"--preset" && i + 1 < argc) {
+            const std::string id = wide_to_utf8(argv[++i]);
+            for (int j = 0; j < kPresetCount; ++j) {
+                if (id == kPresets[j].id) preset_index_ = j;
+            }
         } else if (arg == L"--auto") {
             auto_start_ = true;
         } else if (arg == L"--spout") {
@@ -1024,6 +1037,11 @@ void GuiApp::Impl::draw_encode_outputs() {
                                                L"transport.mp4");
             if (!path.empty()) enc_.record_path = path;
         }
+        ImGui::SetNextItemWidth(100);
+        if (ImGui::InputInt("录制码率 (Mbps)", &record_bitrate_)) {
+            record_bitrate_ = std::clamp(record_bitrate_, 2, 50);
+        }
+        ImGui::TextDisabled("直播参考：1080p60 约 6–8 Mbps，720p60 约 4–6 Mbps。");
     }
     ImGui::EndDisabled();
 
@@ -1139,6 +1157,11 @@ void GuiApp::Impl::draw_encode_preview() {
     if (enc_.source_w > 0) {
         ImGui::TextDisabled("源 %dx%d · 渲染 %.1f fps", enc_.source_w, enc_.source_h,
                             enc_.fps);
+        if (enc_.source == EncodeState::Source::File && enc_.running) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("源 %.1f fps · 丢帧 %llu", enc_.file.fps(),
+                                static_cast<unsigned long long>(enc_.file.dropped()));
+        }
     } else {
         ImGui::TextDisabled("渲染 %.1f fps", enc_.fps);
     }
@@ -1303,6 +1326,11 @@ void GuiApp::Impl::draw_decode_preview() {
     if (dec_.source_w > 0) {
         ImGui::TextDisabled("捕获 %dx%d · 解码 %.1f fps", dec_.source_w, dec_.source_h,
                             dec_.fps);
+        if (dec_.source == DecodeState::Source::File && dec_.running) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("源 %.1f fps · 丢帧 %llu", dec_.file.fps(),
+                                static_cast<unsigned long long>(dec_.file.dropped()));
+        }
     }
     if (!dec_.error.empty()) ImGui::TextColored(kRed, "%s", dec_.error.c_str());
 }
@@ -1675,7 +1703,7 @@ bool GuiApp::Impl::start_encode() {
             if (enc_.record_path.empty()) enc_.record_path = make_record_path();
             auto recorder = std::make_unique<FfmpegSink>();
             if (!recorder->start(device_.Get(), context_.Get(), 1920, 1080, 60.0,
-                                 preset.bitrate, enc_.record_path, &error)) {
+                                 record_bitrate_, enc_.record_path, &error)) {
                 return fail("录制启动失败: " + error);
             }
             enc_.recorder = std::move(recorder);
@@ -1771,6 +1799,16 @@ void GuiApp::Impl::update_encode() {
 
     ++enc_.stat_frames;
     const auto now = Clock::now();
+    if (enc_.source == EncodeState::Source::File && enc_.file.is_open()) {
+        if (enc_.last_file_log.time_since_epoch().count() == 0 ||
+            now - enc_.last_file_log >= std::chrono::seconds(10)) {
+            enc_.last_file_log = now;
+            log_line("file encode: pos=" +
+                     std::to_string(static_cast<long long>(enc_.file.position_ms())) +
+                     "ms fps=" + std::to_string(static_cast<int>(enc_.fps)) +
+                     " dropped=" + std::to_string(enc_.file.dropped()));
+        }
+    }
     const double elapsed = std::chrono::duration<double>(now - enc_.stat_start).count();
     if (elapsed >= 1.0) {
         enc_.fps = static_cast<double>(enc_.stat_frames) / elapsed;
@@ -1959,6 +1997,16 @@ bool GuiApp::Impl::read_source_bgr(cv::Mat& bgr) {
 }
 
 void GuiApp::Impl::apply_detection(const DetectionOutcome& outcome) {
+    const auto now = Clock::now();
+    if (dec_.last_detect_log.time_since_epoch().count() == 0 ||
+        now - dec_.last_detect_log >= std::chrono::seconds(5)) {
+        dec_.last_detect_log = now;
+        log_line("decode detect: capture=" + std::to_string(dec_.source_w) + "x" +
+                 std::to_string(dec_.source_h) +
+                 " markers=" + std::to_string(outcome.markers) +
+                 " ok=" + (outcome.ok ? "1" : "0") +
+                 " ms=" + std::to_string(static_cast<int>(outcome.ms)));
+    }
     if (!outcome.ok) {
         dec_.locked = false;
         dec_.markers = outcome.markers;
@@ -2029,10 +2077,28 @@ void GuiApp::Impl::update_decode() {
                 dec_.detect_tick = 0;
             }
         }
-        if (submit) dec_.detector->submit(bgr);
+        if (submit) {
+            dec_.detector->submit(bgr);
+            dec_.last_detect_frame = bgr.clone();
+        }
         DetectionOutcome outcome;
         while (dec_.detector->take(&outcome)) {
             apply_detection(outcome);
+            if (!outcome.ok && !dec_.last_detect_frame.empty()) {
+                const auto now = Clock::now();
+                if (dec_.last_fail_dump.time_since_epoch().count() == 0 ||
+                    now - dec_.last_fail_dump > std::chrono::seconds(5)) {
+                    dec_.last_fail_dump = now;
+                    std::error_code ec;
+                    std::filesystem::create_directories("out", ec);
+                    char name[128]{};
+                    sprintf_s(name, "out\\decode_fail_%dx%d.png",
+                              dec_.last_detect_frame.cols, dec_.last_detect_frame.rows);
+                    cv::imwrite(name, dec_.last_detect_frame);
+                    log_line("decode fail dump: " + std::string(name) +
+                             " markers=" + std::to_string(outcome.markers));
+                }
+            }
         }
     }
 
@@ -2045,6 +2111,16 @@ void GuiApp::Impl::update_decode() {
 
     ++dec_.stat_frames;
     const auto now = Clock::now();
+    if (dec_.source == DecodeState::Source::File && dec_.file.is_open()) {
+        if (dec_.last_file_log.time_since_epoch().count() == 0 ||
+            now - dec_.last_file_log >= std::chrono::seconds(10)) {
+            dec_.last_file_log = now;
+            log_line("file decode: pos=" +
+                     std::to_string(static_cast<long long>(dec_.file.position_ms())) +
+                     "ms fps=" + std::to_string(static_cast<int>(dec_.fps)) +
+                     " dropped=" + std::to_string(dec_.file.dropped()));
+        }
+    }
     const double elapsed = std::chrono::duration<double>(now - dec_.stat_start).count();
     if (elapsed >= 1.0) {
         dec_.fps = static_cast<double>(dec_.stat_frames) / elapsed;

@@ -37,6 +37,8 @@ const std::map<std::string, Preset>& presets() {
         {"c32_g2_s140", {32, 2, 1.4}},
         {"c16_g1_s100", {16, 1, 1.0}},
         {"c16_g2_s100", {16, 2, 1.0}},
+        {"c64_g2_s100", {64, 2, 1.0}},
+        {"c64_g2_s120", {64, 2, 1.2}},
     };
     return p;
 }
@@ -49,7 +51,7 @@ void usage() {
         << "  obscure-cli decode --input out.mp4 --output restored.mp4 [options]\n\n"
         << "Options:\n"
         << "  --config NAME        c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
-        << "                       c16_g2_s100, c16_g1_s100\n"
+        << "                       c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
         << "  --bitrate N          encode CBR Mbps (default 8)\n"
         << "  --key TEXT           shared key (default obscure-demo-key)\n"
         << "  --frames N           process at most N frames (0 = all)\n"

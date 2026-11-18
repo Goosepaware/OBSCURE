@@ -22,6 +22,8 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
     double fps() const { return fps_; }
+    uint64_t dropped() const { return dropped_; }
+    double position_ms() { return cap_.isOpened() ? cap_.get(cv::CAP_PROP_POS_MSEC) : 0.0; }
     const std::wstring& path() const { return path_; }
 
 private:
@@ -29,9 +31,11 @@ private:
 
     cv::VideoCapture cap_;
     std::wstring path_;
+    std::string ansi_path_;
     int width_ = 0;
     int height_ = 0;
     double fps_ = 60.0;
+    uint64_t dropped_ = 0;
     std::chrono::steady_clock::time_point next_{};
 };
 
