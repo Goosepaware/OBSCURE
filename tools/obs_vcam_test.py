@@ -50,9 +50,6 @@ async def main() -> None:
         pass
 
     settings = {
-        "video_device_id": INPUT,
-        "res_type": 1,
-        "resolution": "1920x1080",
         "active": True,
     }
     await obs.request(
@@ -63,6 +60,14 @@ async def main() -> None:
             "inputKind": "dshow_input",
             "inputSettings": settings,
             "sceneItemEnabled": True,
+        },
+    )
+    await pick(obs, INPUT, "video_device_id", "OBScure")
+    await obs.request(
+        "SetInputSettings",
+        {
+            "inputName": INPUT,
+            "inputSettings": {"res_type": 1, "resolution": "1920x1080"},
         },
     )
     await pick(obs, INPUT, "frame_interval", "60")
