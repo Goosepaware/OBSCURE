@@ -59,6 +59,11 @@ private:
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem item_{nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device_{nullptr};
+    winrt::Windows::Graphics::DirectX::DirectXPixelFormat pixel_format_{
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized};
+    int32_t pool_w_ = 0;
+    int32_t pool_h_ = 0;
     winrt::event_token frame_token_{};
     bool started_ = false;
 };

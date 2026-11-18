@@ -276,6 +276,7 @@ struct GuiApp::Impl {
     char key_buf_[128] = "obscure-demo-key";
     int preset_index_ = 1;
 int record_bitrate_ = 8;
+int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     EncodeState enc_;
     DecodeState dec_;
     std::vector<MonitorInfo> monitors_;
@@ -355,6 +356,7 @@ int record_bitrate_ = 8;
     bool start_decode();
     void stop_decode();
     void update_decode();
+    void reset_decode_detection();
     void apply_detection(const DetectionOutcome& outcome);
     bool read_source_bgr(cv::Mat& bgr);
 
@@ -1218,6 +1220,15 @@ void GuiApp::Impl::draw_decode() {
     ImGui::Separator();
     draw_presets();
     ImGui::Separator();
+    ImGui::TextDisabled("边缘内缩");
+    const char* margin_items[] = {"自动", "0 px", "1 px", "2 px"};
+    int margin_index = margin_override_ + 1;
+    if (ImGui::Combo("##dec_margin", &margin_index, margin_items, 4)) {
+        margin_override_ = margin_index - 1;
+        if (margin_override_ >= 0) dec_.margin = margin_override_;
+    }
+    ImGui::TextDisabled("自动：大窗口内缩 1px，减少 cell 白边。");
+    ImGui::Separator();
     draw_key();
     ImGui::EndChild();
 
@@ -1304,7 +1315,9 @@ void GuiApp::Impl::draw_decode_preview() {
         srv = dec_.decoder->restored_srv();
         width = dec_.decoder->layout().ref_w();
         height = dec_.decoder->layout().ref_h();
-        label = "还原画面 1400x784";
+        char label_buf[64]{};
+        sprintf_s(label_buf, "还原画面 %dx%d", width, height);
+        label = label_buf;
     } else {
         label = "等待输入源";
     }
@@ -1341,6 +1354,8 @@ void GuiApp::Impl::draw_decode_actions() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
         if (ImGui::Button("停止", ImVec2(150, 34))) stop_decode();
         ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::Button("重新识别定位点", ImVec2(180, 34))) reset_decode_detection();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Button, kAccentDim);
         if (ImGui::Button("开始解码", ImVec2(150, 34))) start_decode();
@@ -1864,7 +1879,7 @@ bool GuiApp::Impl::start_decode() {
             dec_.source_h = first.rows;
             dec_.H_initial = identity_scaled(first.cols, first.rows);
             dec_.H = dec_.H_initial.clone();
-            dec_.margin = adaptive_margin(dec_.H);
+            dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
             if (dec_.detect_file) {
                 dec_.detector = std::make_unique<DetectionWorker>(layout, key);
                 dec_.detector->start();
@@ -1924,7 +1939,7 @@ bool GuiApp::Impl::start_decode() {
             dec_.capture = std::move(capture);
             dec_.H_initial = identity_scaled(dec_.source_w, dec_.source_h);
             dec_.H = dec_.H_initial.clone();
-            dec_.margin = adaptive_margin(dec_.H);
+            dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
             dec_.detector = std::make_unique<DetectionWorker>(layout, key);
             dec_.detector->start();
             dec_.locked = false;
@@ -1996,6 +2011,30 @@ bool GuiApp::Impl::read_source_bgr(cv::Mat& bgr) {
     return true;
 }
 
+void GuiApp::Impl::reset_decode_detection() {
+    if (!dec_.running) return;
+    dec_.H_initial = identity_scaled(dec_.source_w, dec_.source_h);
+    dec_.H = dec_.H_initial.clone();
+    dec_.margin = margin_override_ >= 0 ? margin_override_ : adaptive_margin(dec_.H);
+    dec_.locked = false;
+    dec_.markers = 0;
+    dec_.key_ok = false;
+    dec_.detect_ms = 0.0;
+    dec_.detect_tick = 60;
+    dec_.last_detect_frame.release();
+    dec_.last_detect_log = {};
+    if (dec_.detector) {
+        dec_.detector->stop();
+        dec_.detector = std::make_unique<DetectionWorker>(dec_.layout, dec_.key);
+        dec_.detector->start();
+        if (dec_.source == DecodeState::Source::File && dec_.detect_file &&
+            !dec_.last_file_frame.empty()) {
+            dec_.detector->submit(dec_.last_file_frame);
+        }
+    }
+    log_line("decode detection reset");
+}
+
 void GuiApp::Impl::apply_detection(const DetectionOutcome& outcome) {
     const auto now = Clock::now();
     if (dec_.last_detect_log.time_since_epoch().count() == 0 ||
@@ -2015,7 +2054,8 @@ void GuiApp::Impl::apply_detection(const DetectionOutcome& outcome) {
     }
     const bool snap = content_delta(dec_.H_initial, outcome.H, dec_.layout) < 2.0;
     dec_.H = snap ? dec_.H_initial.clone() : outcome.H;
-    dec_.margin = snap ? adaptive_margin(dec_.H) : outcome.margin;
+    const int auto_margin = snap ? adaptive_margin(dec_.H) : outcome.margin;
+    dec_.margin = margin_override_ >= 0 ? margin_override_ : auto_margin;
     dec_.key_ok = outcome.key_ok;
     dec_.markers = outcome.markers;
     dec_.detect_ms = outcome.ms;
@@ -2058,6 +2098,7 @@ void GuiApp::Impl::update_decode() {
             dec_.tex_format = cf;
             dec_.source_w = cw;
             dec_.source_h = ch;
+            reset_decode_detection();
         }
         if (dec_.source_tex) dec_.capture->copy_latest(dec_.source_tex.Get());
     }

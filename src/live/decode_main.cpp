@@ -68,6 +68,8 @@ const std::map<std::string, Preset>& presets() {
         {"c32_g2_s140", {32, 2}},
         {"c16_g1_s100", {16, 1}},
         {"c16_g2_s100", {16, 2}},
+        {"c64_g2_s100", {64, 2}},
+        {"c64_g2_s120", {64, 2}},
     };
     return p;
 }
@@ -405,7 +407,7 @@ int main(int argc, char** argv) {
             << "  --file PATH        decode a transport video (loop)\n"
             << "  --seconds N        run for N seconds (0 = until close, default 0)\n"
             << "  --config NAME      c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
-            << "                     c16_g2_s100, c16_g1_s100\n"
+            << "                     c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
             << "  --key TEXT         shared key (default obscure-demo-key)\n"
             << "  --shader PATH      decode.hlsl path\n"
             << "  --margin auto|0|1|2 decoder inset (default auto)\n"

@@ -131,10 +131,14 @@ bool WgcCapture::start(ID3D11Device* device, ID3D11DeviceContext* context, HWND 
             inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
         const auto size = item_.Size();
+        pool_w_ = size.Width;
+        pool_h_ = size.Height;
+        pixel_format_ = winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized;
+        winrt_device_ = winrt_device;
         frame_pool_ =
             winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                 winrt_device,
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                pixel_format_,
                 2, size);
         session_ = frame_pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(false);
@@ -171,6 +175,9 @@ void WgcCapture::close_winrt() {
             frame_pool_.Close();
             frame_pool_ = nullptr;
         }
+        winrt_device_ = nullptr;
+        pool_w_ = 0;
+        pool_h_ = 0;
         item_ = nullptr;
     } catch (...) {
     }
@@ -214,6 +221,24 @@ void WgcCapture::on_frame() {
     try {
         auto frame = frame_pool_.TryGetNextFrame();
         if (!frame) return;
+
+        // A window capture keeps its original pool size unless we recreate it.
+        // Resizing the player would otherwise leave the decoder locked to the
+        // old size and miss the markers.
+        const auto content = frame.ContentSize();
+        if (content.Width > 0 && content.Height > 0 &&
+            (content.Width != pool_w_ || content.Height != pool_h_)) {
+            try {
+                frame_pool_.Recreate(winrt_device_, pixel_format_, 2, content);
+                pool_w_ = content.Width;
+                pool_h_ = content.Height;
+            } catch (...) {
+                // Fall back to the existing pool; the GUI will retry on resize.
+            }
+            frame.Close();
+            return;
+        }
+
         const auto now = std::chrono::steady_clock::now();
         if (last_copy_.time_since_epoch().count() != 0 &&
             now - last_copy_ < std::chrono::milliseconds(15)) {
