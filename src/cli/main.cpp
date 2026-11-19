@@ -1,6 +1,10 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <io.h>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -13,6 +17,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#include "core/audio_scramble.h"
 #include "core/border.h"
 #include "core/detect.h"
 #include "core/key.h"
@@ -20,6 +25,7 @@
 #include "core/metadata.h"
 #include "core/presets.h"
 #include "core/transform.h"
+#include "io/ffmpeg_audio.h"
 #include "io/ffmpeg_writer.h"
 
 namespace fs = std::filesystem;
@@ -31,7 +37,9 @@ void usage() {
         << "OBScure CLI (phase 1)\n"
         << "  obscure-cli selftest\n"
         << "  obscure-cli encode --input in.mp4 --output out.mp4 [options]\n"
-        << "  obscure-cli decode --input out.mp4 --output restored.mp4 [options]\n\n"
+        << "  obscure-cli decode --input out.mp4 --output restored.mp4 [options]\n"
+        << "  obscure-cli audio --input in.mp4 --output out.wav [--mode strong|mirror]\n"
+        << "                   [--inverse] [--key TEXT] [--public]\n\n"
         << "Options:\n"
         << "  --config NAME        c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
         << "                       c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120,\n"
@@ -41,6 +49,8 @@ void usage() {
         << "  --key TEXT           shared key (default obscure-demo-key)\n"
         << "  --public             use the built-in public key (no secret needed)\n"
         << "  --no-color           disable color scrambling (keep original colors)\n"
+        << "  --no-audio           keep the original audio (skip audio scrambling)\n"
+        << "  --audio-mode MODE    subband (default, strong) or mirror (high fidelity)\n"
         << "  --frames N           process at most N frames (0 = all)\n"
         << "  --start SEC          seek before reading\n"
         << "  --ffmpeg PATH        ffmpeg executable\n"
@@ -96,6 +106,98 @@ void ensure_parent(const std::string& path) {
     if (p.has_parent_path()) {
         fs::create_directories(p.parent_path());
     }
+}
+
+std::string quote_arg(const std::string& s) {
+    if (s.find(' ') == std::string::npos && s.find('\t') == std::string::npos &&
+        s.find('"') == std::string::npos) {
+        return s;
+    }
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else out += c;
+    }
+    out += '"';
+    return out;
+}
+
+int run_audio_command(const std::map<std::string, std::string>& args) {
+    const std::string input = get(args, "input", "");
+    const std::string output = get(args, "output", "");
+    if (input.empty() || output.empty()) {
+        std::cerr << "audio: missing --input or --output\n";
+        return 2;
+    }
+    const std::string ffmpeg = get(args, "ffmpeg", default_ffmpeg());
+    const bool public_key = args.find("public") != args.end();
+    const std::string key =
+        public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
+    const int algorithm = obs::audio_algorithm_from_id(get(args, "mode", "strong"));
+    const bool inverse = args.find("inverse") != args.end();
+
+    obs::AudioScrambleParams params = obs::derive_audio_params(key, algorithm);
+    if (inverse) params = obs::inverse_audio_params(params);
+    obs::AudioScrambler scrambler;
+    std::string error;
+    if (!scrambler.configure(48000, params, &error)) {
+        std::cerr << "audio: " << error << "\n";
+        return 1;
+    }
+
+    const std::string decode_cmd = quote_arg(ffmpeg) +
+                                   " -hide_banner -loglevel error -i " +
+                                   quote_arg(input) +
+                                   " -vn -f f32le -ar 48000 -ac 2 -";
+    std::string encode_cmd = quote_arg(ffmpeg) +
+                             " -hide_banner -loglevel error -y -f f32le"
+                             " -ar 48000 -ac 2 -i - ";
+    const bool wav = output.size() >= 4 &&
+                     (output.substr(output.size() - 4) == ".wav" ||
+                      output.substr(output.size() - 4) == ".WAV");
+    encode_cmd += wav ? "-c:a pcm_f32le " : "-c:a aac -b:a 192k ";
+    encode_cmd += quote_arg(output);
+
+    FILE* pipe_in = _popen(decode_cmd.c_str(), "rb");
+    if (!pipe_in) {
+        std::cerr << "audio: failed to start ffmpeg decoder\n";
+        return 1;
+    }
+    _setmode(_fileno(pipe_in), _O_BINARY);
+    FILE* pipe_out = _popen(encode_cmd.c_str(), "wb");
+    if (!pipe_out) {
+        _pclose(pipe_in);
+        std::cerr << "audio: failed to start ffmpeg encoder\n";
+        return 1;
+    }
+    _setmode(_fileno(pipe_out), _O_BINARY);
+
+    constexpr int kBlock = 1024;
+    std::vector<float> in_buf(static_cast<size_t>(kBlock) * 2);
+    std::vector<float> out_buf(static_cast<size_t>(kBlock) * 2);
+    uint64_t total_frames = 0;
+    for (;;) {
+        const size_t got = std::fread(in_buf.data(), sizeof(float), in_buf.size(), pipe_in);
+        if (got < 2) break;
+        const int frames = static_cast<int>(got / 2);
+        scrambler.process(in_buf.data(), out_buf.data(), frames);
+        if (std::fwrite(out_buf.data(), sizeof(float),
+                        static_cast<size_t>(frames) * 2, pipe_out) !=
+            static_cast<size_t>(frames) * 2) {
+            break;
+        }
+        total_frames += static_cast<uint64_t>(frames);
+    }
+    const int rc_in = _pclose(pipe_in);
+    const int rc_out = _pclose(pipe_out);
+    if (rc_in != 0 || rc_out != 0) {
+        std::cerr << "audio: ffmpeg failed (in=" << rc_in << " out=" << rc_out << ")\n";
+        return 1;
+    }
+    std::cout << "[audio] mode=" << (inverse ? "inverse/" : "")
+              << obs::audio_algorithm_id(algorithm) << " frames=" << total_frames
+              << " (" << (static_cast<double>(total_frames) / 48000.0) << " s)\n";
+    return 0;
 }
 
 int run_selftest() {
@@ -326,14 +428,115 @@ int run_selftest() {
                 pub_key.key_id == obs::public_key_id();
         }
 
+        // Audio metadata flags: both the "audio obfuscated" bit and the
+        // algorithm bit must survive the packet round trip.
+        obs::TransportOptions audio_options;
+        audio_options.use_audio = true;
+        audio_options.audio_algorithm =
+            static_cast<int>(obs::AudioAlgorithm::MirrorInversion);
+        const std::vector<int> audio_bits =
+            obs::build_metadata_bits(layout, key.key_id, audio_options);
+        std::vector<int> audio_packet(audio_bits.begin(),
+                                      audio_bits.begin() + obs::kMetaPacketBits);
+        const auto audio_meta = obs::parse_metadata(audio_packet);
+        const bool audio_meta_ok =
+            audio_meta.has_value() && audio_meta->use_audio() &&
+            audio_meta->audio_algorithm() ==
+                static_cast<int>(obs::AudioAlgorithm::MirrorInversion);
+
+        // Audio DSP round trip. The transform is time-invariant; the decoder
+        // output is only delayed by the two FIR stages, so search a small
+        // delay window and compare the waveforms.
+        auto audio_roundtrip = [](int algorithm, double min_snr,
+                                  double max_scrambled_snr) {
+            const std::string audio_key = "obscure-audio-selftest";
+            obs::AudioScrambler enc;
+            obs::AudioScrambler dec;
+            std::string err;
+            if (!enc.configure(48000, audio_key, algorithm, &err)) return false;
+            if (!dec.configure(
+                    48000,
+                    obs::inverse_audio_params(
+                        obs::derive_audio_params(audio_key, algorithm)),
+                    &err)) {
+                return false;
+            }
+            constexpr int kFrames = 24000;
+            std::vector<float> src(static_cast<size_t>(kFrames) * 2);
+            std::vector<float> scrambled(static_cast<size_t>(kFrames) * 2);
+            std::vector<float> out(static_cast<size_t>(kFrames) * 2);
+            constexpr double kPi = 3.14159265358979323846;
+            uint32_t rng = 0x12345678u;
+            for (int i = 0; i < kFrames; ++i) {
+                const double t = static_cast<double>(i) / 48000.0;
+                double v = 0.08 * std::sin(2.0 * kPi * 300.0 * t) +
+                           0.06 * std::sin(2.0 * kPi * 820.0 * t) +
+                           0.05 * std::sin(2.0 * kPi * 1600.0 * t) +
+                           0.04 * std::sin(2.0 * kPi * 3100.0 * t) +
+                           0.03 * std::sin(2.0 * kPi * 4700.0 * t) +
+                           0.02 * std::sin(2.0 * kPi * 6800.0 * t);
+                rng = rng * 1664525u + 1013904223u;
+                v += (static_cast<double>(rng >> 9) / 4194304.0 - 1.0) * 0.01;
+                src[static_cast<size_t>(i) * 2] = static_cast<float>(v);
+                src[static_cast<size_t>(i) * 2 + 1] = static_cast<float>(v * 0.9);
+            }
+            enc.process(src.data(), scrambled.data(), kFrames);
+            dec.process(scrambled.data(), out.data(), kFrames);
+
+            auto snr = [&](const std::vector<float>& reference,
+                           const std::vector<float>& test, int delay) {
+                double signal = 0.0;
+                double error = 0.0;
+                for (int i = 4000; i < kFrames - 4000; ++i) {
+                    for (int ch = 0; ch < 2; ++ch) {
+                        const size_t a = static_cast<size_t>(i) * 2 + ch;
+                        const int j = i + delay;
+                        if (j < 0 || j >= kFrames) continue;
+                        const size_t b = static_cast<size_t>(j) * 2 + ch;
+                        const double e = reference[a] - test[b];
+                        signal += static_cast<double>(reference[a]) * reference[a];
+                        error += e * e;
+                    }
+                }
+                return error > 1e-12
+                           ? 10.0 * std::log10(signal / error)
+                           : (signal > 1e-12 ? 120.0 : 0.0);
+            };
+
+            const int base_delay = enc.latency_samples() + dec.latency_samples();
+            double best = -1000.0;
+            for (int d = base_delay - 96; d <= base_delay + 96; ++d) {
+                best = std::max(best, snr(src, out, d));
+            }
+            double scrambled_best = -1000.0;
+            for (int d = enc.latency_samples() - 96;
+                 d <= enc.latency_samples() + 96; ++d) {
+                scrambled_best = std::max(scrambled_best, snr(src, scrambled, d));
+            }
+            std::cout << "  audio algo=" << algorithm << " snr=" << best
+                      << " scrambled=" << scrambled_best << "\n";
+            return best >= min_snr && scrambled_best <= max_scrambled_snr;
+        };
+
+        const bool audio_strong_ok =
+            audio_roundtrip(static_cast<int>(obs::AudioAlgorithm::SubbandShift), 4.0,
+                            0.0);
+        const bool audio_mirror_ok =
+            audio_roundtrip(static_cast<int>(obs::AudioAlgorithm::MirrorInversion), 6.0,
+                            0.0);
+
         std::cout << "selftest: exact=" << exact << " maxdiff=" << max_diff
                   << " markers=" << det.marker_count << " h_err=" << det.reproj_error
                   << " metadata=" << meta_ok << " public=" << public_ok
                   << " dihedral=" << dihedral_ok << " color=" << color_ok
                   << " hilbert=" << hilbert_ok << " curves=" << curves_ok
-                  << " public_curve=" << public_curve_ok << "\n";
+                  << " public_curve=" << public_curve_ok
+                  << " audio_strong=" << audio_strong_ok
+                  << " audio_mirror=" << audio_mirror_ok
+                  << " audio_meta=" << audio_meta_ok << "\n";
         const bool ok = exact && markers_ok && meta_ok && public_ok && dihedral_ok &&
-                        color_ok && hilbert_ok && curves_ok && public_curve_ok;
+                        color_ok && hilbert_ok && curves_ok && public_curve_ok &&
+                        audio_strong_ok && audio_mirror_ok && audio_meta_ok;
         std::cout << (ok ? "SELFTEST OK" : "SELFTEST FAILED") << "\n";
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
@@ -357,6 +560,9 @@ int main(int argc, char** argv) {
     if (mode == "selftest") {
         return run_selftest();
     }
+    if (mode == "audio") {
+        return run_audio_command(parse_args(argc, argv));
+    }
     if (mode != "encode" && mode != "decode") {
         usage();
         return 2;
@@ -375,6 +581,9 @@ int main(int argc, char** argv) {
     const std::string key_text =
         public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
     const std::string ffmpeg = get(args, "ffmpeg", default_ffmpeg());
+    const bool audio_enabled = args.find("no-audio") == args.end();
+    const int audio_algorithm =
+        obs::audio_algorithm_from_id(get(args, "audio-mode", "subband"));
     const int max_frames = get_int(args, "frames", 0);
     const double start_sec = get_double(args, "start", 0.0);
     const double bitrate = get_double(args, "bitrate", 8.0);
@@ -414,11 +623,15 @@ int main(int argc, char** argv) {
         options.preset_id = preset_index + 1;
         options.scale_x10 = obs::preset_scale_x10(preset);
         options.algorithm = preset.algorithm;
+        options.use_audio = audio_enabled;
+        options.audio_algorithm = audio_algorithm;
         const cv::Mat border = obs::build_border(layout, key, options);
 
         std::cout << "[config] " << config << " cell=" << layout.cell
                   << " guard=" << layout.guard << " scale=" << preset.scale
                   << " algo=" << obs::scramble_algorithm_id(layout.algorithm)
+                  << " audio="
+                  << (audio_enabled ? obs::audio_algorithm_id(audio_algorithm) : "off")
                   << " grid=" << layout.cols() << "x" << layout.rows()
                   << " ref=" << layout.ref_w() << "x" << layout.ref_h()
                   << " key=" << std::hex << std::uppercase << key.key_id << std::dec
@@ -444,10 +657,23 @@ int main(int argc, char** argv) {
         if (!output.empty()) ensure_parent(output);
         obs::FfmpegWriter writer;
         const bool write_output = !output.empty();
+        const bool audio_active = audio_enabled && write_output;
+        const fs::path final_path = write_output ? fs::path(output) : fs::path();
+        fs::path video_path = final_path;
+        fs::path audio_wav;
+        if (audio_active) {
+            const auto stamp =
+                std::chrono::steady_clock::now().time_since_epoch().count();
+            const std::string suffix = std::to_string(stamp);
+            video_path = fs::temp_directory_path() /
+                         ("obscure_video_" + suffix + final_path.extension().string());
+            audio_wav = fs::temp_directory_path() /
+                        ("obscure_audio_" + suffix + ".wav");
+        }
         if (write_output) {
             const int out_w = mode == "encode" ? layout.canvas_w : layout.ref_w();
             const int out_h = mode == "encode" ? layout.canvas_h : layout.ref_h();
-            if (!writer.open(ffmpeg, output, out_w, out_h, fps, bitrate,
+            if (!writer.open(ffmpeg, video_path.string(), out_w, out_h, fps, bitrate,
                              mode == "decode")) {
                 throw std::runtime_error(writer.error());
             }
@@ -560,6 +786,38 @@ int main(int argc, char** argv) {
         cap.release();
         if (write_output && !writer.close()) {
             throw std::runtime_error(writer.error());
+        }
+
+        if (audio_active) {
+            std::string audio_error;
+            obs::AudioScrambleParams audio_params =
+                obs::derive_audio_params(key_text, audio_algorithm);
+            if (mode == "decode") {
+                audio_params = obs::inverse_audio_params(audio_params);
+            }
+            const std::wstring ffmpeg_w = fs::path(ffmpeg).wstring();
+            bool audio_ok = obs::audio_process_to_wav(
+                ffmpeg_w, fs::path(input).wstring(), audio_wav.wstring(),
+                audio_params, 48000, &audio_error);
+            if (audio_ok) {
+                audio_ok = obs::audio_mux(ffmpeg_w, video_path.wstring(),
+                                          audio_wav.wstring(),
+                                          fs::path(output).wstring(), 192,
+                                          &audio_error);
+            }
+            std::error_code ec;
+            if (audio_ok) {
+                std::cout << "[audio] muxed "
+                          << (mode == "decode" ? "inverse/" : "")
+                          << obs::audio_algorithm_id(audio_algorithm) << " into "
+                          << output << "\n";
+            } else {
+                std::cerr << "[warn] audio mux skipped: " << audio_error << "\n";
+                fs::copy_file(video_path, final_path,
+                              fs::copy_options::overwrite_existing, ec);
+            }
+            fs::remove(video_path, ec);
+            fs::remove(audio_wav, ec);
         }
 
         const auto t1 = std::chrono::steady_clock::now();

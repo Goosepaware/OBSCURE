@@ -101,6 +101,20 @@ bool load_gui_settings(GuiSettings* settings) {
     settings->export_source_encode = parse_wide(values, "export_source_encode");
     settings->export_source_decode = parse_wide(values, "export_source_decode");
     settings->player_loop = parse_bool(values, "player_loop", settings->player_loop);
+    settings->audio_device_id = parse_wide(values, "audio_device_id");
+    const auto vol = values.find("audio_volume");
+    if (vol != values.end()) {
+        try {
+            settings->audio_volume = std::clamp(std::stof(vol->second), 0.0f, 2.0f);
+        } catch (...) {
+        }
+    }
+    settings->enc_audio = parse_bool(values, "enc_audio", settings->enc_audio);
+    settings->enc_audio_algorithm =
+        parse_int(values, "enc_audio_algorithm", settings->enc_audio_algorithm);
+    settings->dec_audio = parse_bool(values, "dec_audio", settings->dec_audio);
+    settings->dec_audio_algorithm =
+        parse_int(values, "dec_audio_algorithm", settings->dec_audio_algorithm);
     return true;
 }
 
@@ -135,6 +149,12 @@ bool save_gui_settings(const GuiSettings& settings) {
     out << "export_source_encode=" << wide_to_utf8(settings.export_source_encode) << "\n";
     out << "export_source_decode=" << wide_to_utf8(settings.export_source_decode) << "\n";
     out << "player_loop=" << (settings.player_loop ? 1 : 0) << "\n";
+    out << "audio_device_id=" << wide_to_utf8(settings.audio_device_id) << "\n";
+    out << "audio_volume=" << settings.audio_volume << "\n";
+    out << "enc_audio=" << (settings.enc_audio ? 1 : 0) << "\n";
+    out << "enc_audio_algorithm=" << settings.enc_audio_algorithm << "\n";
+    out << "dec_audio=" << (settings.dec_audio ? 1 : 0) << "\n";
+    out << "dec_audio_algorithm=" << settings.dec_audio_algorithm << "\n";
 
     {
         std::ofstream file(tmp, std::ios::binary | std::ios::trunc);

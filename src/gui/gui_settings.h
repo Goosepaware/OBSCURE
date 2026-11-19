@@ -34,6 +34,13 @@ struct GuiSettings {
     std::wstring export_source_decode;
 
     bool player_loop = true;
+
+    std::wstring audio_device_id;
+    float audio_volume = 1.0f;
+    bool enc_audio = true;
+    int enc_audio_algorithm = 0;
+    bool dec_audio = true;
+    int dec_audio_algorithm = 0;
 };
 
 std::wstring gui_settings_path();

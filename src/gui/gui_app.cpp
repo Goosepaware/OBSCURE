@@ -43,7 +43,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "core/metadata.h"
 #include "core/presets.h"
 #include "gui/gui_settings.h"
+#include "io/ffmpeg_audio.h"
 #include "io/ffmpeg_sink.h"
+#include "live/audio_engine.h"
 #include "live/d3d_helpers.h"
 #include "live/decode_pipeline.h"
 #include "live/detection_worker.h"
@@ -56,6 +58,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "live/vcam_registry.h"
 #include "live/vcam_sink.h"
 #include "live/wgc_capture.h"
+#include "platform/wasapi_audio.h"
 #include "platform/win_util.h"
 
 namespace fs = std::filesystem;
@@ -79,6 +82,16 @@ bool g_console_min_size = false;
 
 const wchar_t kVideoFilter[] =
     L"视频文件\0*.mp4;*.mkv;*.mov;*.avi;*.ts\0所有文件\0*.*\0";
+
+const std::wstring& ffmpeg_tool_path() {
+    static const std::wstring path = [] {
+        if (fs::exists("D:/program/OBScure/ffmpeg.exe")) {
+            return std::wstring(L"D:/program/OBScure/ffmpeg.exe");
+        }
+        return std::wstring(L"ffmpeg");
+    }();
+    return path;
+}
 
 struct DpiScope {
     DPI_AWARENESS_CONTEXT old = nullptr;
@@ -345,6 +358,9 @@ struct GuiApp::Impl {
         KeyMaterial key;
         bool use_color = true;
         bool use_dihedral = true;
+        bool audio_enabled = false;
+        int audio_algorithm = 0;
+        std::string audio_key;
         TransportOptions transport;
         std::unique_ptr<FileSource> file;
         std::unique_ptr<EncodePipeline> encoder;
@@ -385,6 +401,17 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     bool auto_match_settings_ = true;
     Clock::time_point key_copied_until_{};
     GuiSettings settings_;
+
+    std::vector<AudioDeviceInfo> audio_devices_;
+    int audio_device_index_ = 0;  // 0 default, 1 none, 2+ device
+    float audio_volume_ = 1.0f;
+    bool enc_audio_enabled_ = true;
+    int enc_audio_algorithm_ = 0;
+    bool dec_audio_enabled_ = true;
+    int dec_audio_algorithm_ = 0;
+    AudioEngine audio_engine_;
+    std::wstring audio_source_wav_;
+    std::wstring audio_record_wav_;
     bool detached_preview_ = false;
     bool start_detached_ = false;
     std::unique_ptr<PreviewWindow> preview_window_;
@@ -457,6 +484,13 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void draw_encode_source();
     void draw_encode_outputs();
     void draw_presets();
+    void draw_audio_settings(bool for_decode);
+    std::wstring audio_device_id() const;
+    bool start_audio(bool decode_mode, const std::wstring& file_path,
+                     std::string* error);
+    void stop_audio();
+    void restart_decode_audio();
+    void mux_recorded_audio();
     void draw_key();
     void draw_encode_preview();
     void draw_decode_source();
@@ -602,6 +636,23 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
         settings_.console_w = 480;
     }
     if (settings_.console_h < 620) settings_.console_h = 820;
+    audio_devices_ = list_audio_render_devices();
+    audio_volume_ = std::clamp(settings_.audio_volume, 0.0f, 2.0f);
+    enc_audio_enabled_ = settings_.enc_audio;
+    enc_audio_algorithm_ = std::clamp(settings_.enc_audio_algorithm, 0, 1);
+    dec_audio_enabled_ = settings_.dec_audio;
+    dec_audio_algorithm_ = std::clamp(settings_.dec_audio_algorithm, 0, 1);
+    audio_device_index_ = 0;
+    if (settings_.audio_device_id == L"none") {
+        audio_device_index_ = 1;
+    } else if (!settings_.audio_device_id.empty()) {
+        for (size_t i = 0; i < audio_devices_.size(); ++i) {
+            if (audio_devices_[i].id == settings_.audio_device_id) {
+                audio_device_index_ = static_cast<int>(i) + 2;
+                break;
+            }
+        }
+    }
     parse_command_line();
     start_detached_ =
         auto_no_detach_ ? false : (auto_detach_ || settings_.detached_preview);
@@ -662,6 +713,20 @@ void GuiApp::Impl::parse_command_line() {
             preset_index_ = default_preset_for_algorithm(1);
             enc_use_color_ = false;
             dec_.use_color = false;
+        } else if (arg == L"--audio-mode" && i + 1 < argc) {
+            const int algorithm = audio_algorithm_from_id(wide_to_utf8(argv[++i]));
+            enc_audio_algorithm_ = algorithm;
+            dec_audio_algorithm_ = algorithm;
+        } else if (arg == L"--no-audio") {
+            enc_audio_enabled_ = false;
+            dec_audio_enabled_ = false;
+        } else if (arg == L"--audio-out" && i + 1 < argc) {
+            const std::wstring value = argv[++i];
+            if (value == L"none") {
+                audio_device_index_ = 1;
+            } else if (value == L"default") {
+                audio_device_index_ = 0;
+            }
         } else if (arg == L"--key" && i + 1 < argc) {
             const std::string text = wide_to_utf8(argv[++i]);
             strncpy_s(key_buf_, text.c_str(), _TRUNCATE);
@@ -825,6 +890,12 @@ void GuiApp::Impl::save_settings() {
         settings_.preview_topmost = preview_window_->topmost();
     }
     settings_.detached_preview = detached_preview_;
+    settings_.audio_device_id = audio_device_id();
+    settings_.audio_volume = audio_volume_;
+    settings_.enc_audio = enc_audio_enabled_;
+    settings_.enc_audio_algorithm = enc_audio_algorithm_;
+    settings_.dec_audio = dec_audio_enabled_;
+    settings_.dec_audio_algorithm = dec_audio_algorithm_;
     save_gui_settings(settings_);
 }
 
@@ -1321,6 +1392,7 @@ void GuiApp::Impl::draw_encode() {
     draw_encode_source();
     ImGui::Separator();
     draw_encode_outputs();
+    draw_audio_settings(false);
     ImGui::Separator();
     draw_presets();
     ImGui::Separator();
@@ -1513,6 +1585,64 @@ void GuiApp::Impl::draw_presets() {
     }
 }
 
+void GuiApp::Impl::draw_audio_settings(bool for_decode) {
+    ImGui::Separator();
+    ImGui::TextDisabled("音频");
+    bool& enabled = for_decode ? dec_audio_enabled_ : enc_audio_enabled_;
+    int& algorithm = for_decode ? dec_audio_algorithm_ : enc_audio_algorithm_;
+    const bool busy = enc_.running || dec_.running;
+    ImGui::BeginDisabled(busy);
+    ImGui::Checkbox(for_decode ? "音频还原" : "音频混淆", &enabled);
+    if (enabled) {
+        const char* algorithms[] = {"强混淆（移频+倒置）", "高保真（全带镜像）"};
+        ImGui::Combo("##audio_algo", &algorithm, algorithms, 2);
+        std::string preview = "系统默认";
+        if (audio_device_index_ == 1) {
+            preview = "不输出（仅录制）";
+        } else if (audio_device_index_ >= 2) {
+            const int idx = audio_device_index_ - 2;
+            if (idx >= 0 && idx < static_cast<int>(audio_devices_.size())) {
+                preview = wide_to_utf8(audio_devices_[static_cast<size_t>(idx)].name);
+            }
+        }
+        if (ImGui::BeginCombo("##audio_device", preview.c_str())) {
+            if (ImGui::Selectable("系统默认", audio_device_index_ == 0)) {
+                audio_device_index_ = 0;
+            }
+            if (ImGui::Selectable("不输出（仅录制）", audio_device_index_ == 1)) {
+                audio_device_index_ = 1;
+            }
+            for (int i = 0; i < static_cast<int>(audio_devices_.size()); ++i) {
+                const std::string name =
+                    wide_to_utf8(audio_devices_[static_cast<size_t>(i)].name);
+                if (ImGui::Selectable(name.c_str(), audio_device_index_ == i + 2)) {
+                    audio_device_index_ = i + 2;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::SliderFloat("音量", &audio_volume_, 0.0f, 2.0f, "%.2f")) {
+            audio_engine_.set_volume(audio_volume_);
+        }
+        ImGui::TextWrapped("OBS：用“应用程序音频捕获”，\n或把输出选到虚拟声卡。");
+        if (for_decode) {
+            ImGui::TextWrapped("窗口/显示器解码请选不同设备，\n避免回环自激。");
+        }
+    }
+    ImGui::EndDisabled();
+}
+
+std::wstring GuiApp::Impl::audio_device_id() const {
+    if (audio_device_index_ == 1) return L"none";
+    if (audio_device_index_ >= 2) {
+        const int idx = audio_device_index_ - 2;
+        if (idx >= 0 && idx < static_cast<int>(audio_devices_.size())) {
+            return audio_devices_[static_cast<size_t>(idx)].id;
+        }
+    }
+    return L"";
+}
+
 void GuiApp::Impl::draw_key() {
     ImGui::TextDisabled("共享密钥");
     ImGui::BeginDisabled(enc_.running || public_mode_);
@@ -1695,6 +1825,8 @@ void GuiApp::Impl::draw_decode() {
                       ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
     draw_decode_source();
+    ImGui::Separator();
+    draw_audio_settings(true);
     ImGui::Separator();
     draw_presets();
     ImGui::Separator();
@@ -2287,6 +2419,11 @@ bool GuiApp::Impl::start_export(bool for_decode) {
         state.transport.preset_id = preset_index_ + 1;
         state.transport.scale_x10 = preset_scale_x10(preset);
         state.transport.algorithm = preset.algorithm;
+        state.audio_enabled = enc_audio_enabled_;
+        state.audio_algorithm = enc_audio_algorithm_;
+        state.audio_key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
+        state.transport.use_audio = state.audio_enabled;
+        state.transport.audio_algorithm = state.audio_algorithm;
         state.encoder = std::make_unique<EncodePipeline>();
         if (!state.encoder->init(device_.Get(), context_.Get(), layout, key,
                                  preset.scale, state.transport,
@@ -2327,6 +2464,8 @@ bool GuiApp::Impl::start_export(bool for_decode) {
             }
             layout = *target;
             applied_meta = md;
+            dec_audio_enabled_ = md.use_audio();
+            dec_audio_algorithm_ = md.audio_algorithm();
             if (md.public_mode()) {
                 public_mode_ = true;
                 layout.key = kPublicKey;
@@ -2414,6 +2553,9 @@ bool GuiApp::Impl::start_export(bool for_decode) {
         state.key = key;
         state.use_color = use_color;
         state.use_dihedral = use_dihedral;
+        state.audio_enabled = dec_audio_enabled_;
+        state.audio_algorithm = dec_audio_algorithm_;
+        state.audio_key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         dec_.use_color = use_color;
         dec_.use_dihedral = use_dihedral;
         if (applied_meta) dec_.video_meta = *applied_meta;
@@ -2544,6 +2686,42 @@ void GuiApp::Impl::finish_export(bool cancelled) {
         export_.sink->stop();
         if (!export_.sink->error().empty()) export_.error = export_.sink->error();
         export_.sink.reset();
+    }
+    if (!cancelled && export_.error.empty() && export_.audio_enabled &&
+        !export_.source_path.empty() && !export_.output_path.empty() &&
+        fs::exists(export_.output_path)) {
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        const fs::path temp =
+            fs::temp_directory_path() /
+            (L"obscure_export_audio_" + std::to_wstring(stamp) + L".wav");
+        std::string audio_error;
+        obs::AudioScrambleParams params =
+            derive_audio_params(export_.audio_key, export_.audio_algorithm);
+        if (export_.for_decode) params = inverse_audio_params(params);
+        if (audio_process_to_wav(ffmpeg_tool_path(), export_.source_path,
+                                 temp.wstring(), params, 48000,
+                                 &audio_error)) {
+            const fs::path out(export_.output_path);
+            const fs::path muxed =
+                out.parent_path() /
+                (out.stem().wstring() + L".audio_mux" + out.extension().wstring());
+            if (audio_mux(ffmpeg_tool_path(), export_.output_path,
+                          temp.wstring(), muxed.wstring(), 192, &audio_error)) {
+                if (MoveFileExW(muxed.c_str(), export_.output_path.c_str(),
+                                MOVEFILE_REPLACE_EXISTING)) {
+                    log_line("export audio muxed");
+                } else {
+                    log_line("export audio mux move failed");
+                }
+            } else {
+                log_line("export audio mux failed: " + audio_error);
+            }
+        } else {
+            log_line("export audio skipped: " + audio_error);
+        }
+        std::error_code ec;
+        fs::remove(temp, ec);
     }
     export_.encoder.reset();
     export_.decoder.reset();
@@ -2815,6 +2993,12 @@ void GuiApp::Impl::draw_video_info() {
     }
     info << "\n算法："
          << (m.algorithm() == 1 ? "空间曲线（无黑边/不旋转）" : "经典网格");
+    info << "\n音频：";
+    if (!m.use_audio()) {
+        info << "未混淆";
+    } else {
+        info << (m.audio_algorithm() == 1 ? "高保真镜像" : "强混淆移频+倒置");
+    }
     info << (m.use_color() ? " · 颜色混淆 开" : " · 颜色混淆 关");
     ImGui::TextWrapped("%s", info.str().c_str());
     if (!m.public_mode() && m.key_id != dec_.key.key_id) {
@@ -3097,6 +3281,106 @@ std::wstring GuiApp::Impl::make_record_path() {
     return (dir / name).wstring();
 }
 
+bool GuiApp::Impl::start_audio(bool decode_mode, const std::wstring& file_path,
+                               std::string* error) {
+    audio_engine_.stop();
+    if (!audio_source_wav_.empty()) {
+        DeleteFileW(audio_source_wav_.c_str());
+    }
+    audio_source_wav_.clear();
+    audio_record_wav_.clear();
+    const bool enabled = decode_mode ? dec_audio_enabled_ : enc_audio_enabled_;
+    if (!enabled) return true;
+    const int algorithm = decode_mode ? dec_audio_algorithm_ : enc_audio_algorithm_;
+
+    std::wstring source_wav;
+    if (!file_path.empty()) {
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        source_wav = (fs::temp_directory_path() /
+                      (L"obscure_src_audio_" + std::to_wstring(stamp) + L".wav"))
+                         .wstring();
+        if (!audio_extract_wav(ffmpeg_tool_path(), file_path, source_wav, error)) {
+            if (error && error->empty()) *error = "audio extraction failed";
+            audio_source_wav_.clear();
+            return false;
+        }
+        audio_source_wav_ = source_wav;
+        std::error_code size_ec;
+        const auto wav_size = fs::file_size(source_wav, size_ec);
+        log_line("audio extracted: " + wide_to_utf8(source_wav) + " " +
+                 std::to_string(size_ec ? 0 : wav_size) + " bytes");
+    }
+
+    if (!decode_mode && enc_.out_record && !enc_.record_path.empty()) {
+        audio_record_wav_ = enc_.record_path + L".audio.wav";
+    }
+
+    AudioEngineConfig config;
+    config.decode_mode = decode_mode;
+    config.algorithm = algorithm;
+    config.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
+    config.output_device_id = audio_device_id();
+    config.volume = audio_volume_;
+    config.source_wav = source_wav;
+    config.record_wav = audio_record_wav_;
+    if (config.output_device_id == L"none" && config.record_wav.empty()) {
+        return true;
+    }
+    if (!audio_engine_.start(config, error)) {
+        if (error && error->empty()) *error = "audio engine start failed";
+        log_line("audio engine start failed: " + (error ? *error : "(null)"));
+        audio_source_wav_.clear();
+        audio_record_wav_.clear();
+        return false;
+    }
+    log_line(std::string("audio started: ") +
+             (decode_mode ? "decode/" : "encode/") +
+             audio_algorithm_id(algorithm) +
+             (source_wav.empty() ? " loopback" : " file"));
+    return true;
+}
+
+void GuiApp::Impl::stop_audio() {
+    audio_engine_.stop();
+}
+
+void GuiApp::Impl::restart_decode_audio() {
+    if (!dec_.running) return;
+    stop_audio();
+    std::string error;
+    const std::wstring file =
+        dec_.source == DecodeState::Source::File ? dec_.file_path : L"";
+    if (!start_audio(true, file, &error)) {
+        log_line("decode audio restart failed: " + error);
+    }
+}
+
+void GuiApp::Impl::mux_recorded_audio() {
+    if (audio_record_wav_.empty() || !enc_.out_record ||
+        enc_.record_path.empty()) {
+        return;
+    }
+    if (!fs::exists(enc_.record_path) || !fs::exists(audio_record_wav_)) {
+        audio_record_wav_.clear();
+        return;
+    }
+    const std::wstring muxed = enc_.record_path + L".audio_mux.mp4";
+    std::string error;
+    if (audio_mux(ffmpeg_tool_path(), enc_.record_path, audio_record_wav_,
+                  muxed, 192, &error)) {
+        if (MoveFileExW(muxed.c_str(), enc_.record_path.c_str(),
+                        MOVEFILE_REPLACE_EXISTING)) {
+            log_line("recording audio muxed");
+        } else {
+            log_line("recording audio mux move failed");
+        }
+    } else {
+        log_line("recording audio mux failed: " + error);
+    }
+    audio_record_wav_.clear();
+}
+
 bool GuiApp::Impl::start_encode() {
     if (enc_.running) return true;
     if (export_.running) {
@@ -3126,6 +3410,8 @@ bool GuiApp::Impl::start_encode() {
         options.preset_id = preset_index_ + 1;
         options.scale_x10 = preset_scale_x10(preset);
         options.algorithm = preset.algorithm;
+        options.use_audio = enc_audio_enabled_;
+        options.audio_algorithm = enc_audio_algorithm_;
 
         auto encoder = std::make_unique<EncodePipeline>();
         std::string error;
@@ -3253,6 +3539,16 @@ bool GuiApp::Impl::start_encode() {
             enc_.recorder = std::move(recorder);
         }
 
+        if (enc_audio_enabled_) {
+            std::string audio_error;
+            const std::wstring source_file =
+                enc_.source == EncodeState::Source::File ? enc_.file_path : L"";
+            if (!start_audio(false, source_file, &audio_error)) {
+                log_line("encode audio failed: " + audio_error);
+                set_error(std::string("音频不可用: ") + audio_error);
+            }
+        }
+
         enc_.stat_frames = 0;
         enc_.fps = 0.0;
         enc_.stat_start = Clock::now();
@@ -3261,6 +3557,9 @@ bool GuiApp::Impl::start_encode() {
                  scramble_algorithm_id(preset.algorithm) +
                  " color=" + ((kPresets[preset_index_].algorithm == 0 && enc_use_color_)
                                   ? "on"
+                                  : "off") +
+                 " audio=" + (enc_audio_enabled_
+                                  ? audio_algorithm_id(enc_audio_algorithm_)
                                   : "off"));
         return true;
     } catch (const std::exception& e) {
@@ -3272,6 +3571,7 @@ bool GuiApp::Impl::start_encode() {
 
 void GuiApp::Impl::stop_encode() {
     enc_.running = false;
+    stop_audio();
     if (enc_.capture) {
         enc_.capture->stop();
         enc_.capture.reset();
@@ -3293,6 +3593,7 @@ void GuiApp::Impl::stop_encode() {
         if (!enc_.recorder->error().empty()) enc_.error = enc_.recorder->error();
         enc_.recorder.reset();
     }
+    mux_recorded_audio();
     enc_.file.close();
     enc_.encoder.reset();
     enc_.fps = 0.0;
@@ -3309,6 +3610,11 @@ void GuiApp::Impl::update_encode() {
             enc_.tex_format = DXGI_FORMAT_B8G8R8A8_UNORM;
             enc_.source_w = frame.cols;
             enc_.source_h = frame.rows;
+        }
+        if (audio_engine_.active()) {
+            audio_engine_.set_position_ms(enc_.file.position_ms());
+            audio_engine_.set_playing(!enc_.file.paused());
+            audio_engine_.set_loop(enc_.file.loop());
         }
     } else if (enc_.capture) {
         if (enc_.source == EncodeState::Source::Window &&
@@ -3459,6 +3765,8 @@ bool GuiApp::Impl::start_decode() {
                                 metadata->algorithm());
                             if (idx >= 0) preset_index_ = idx;
                         }
+                        dec_audio_enabled_ = metadata->use_audio();
+                        dec_audio_algorithm_ = metadata->audio_algorithm();
                         dec_.metadata_applied = true;
                     }
                     dec_.key_ok = metadata->public_mode()
@@ -3546,9 +3854,19 @@ bool GuiApp::Impl::start_decode() {
         dec_.fps = 0.0;
         dec_.stat_start = Clock::now();
         dec_.running = true;
+        if (dec_audio_enabled_) {
+            std::string audio_error;
+            const std::wstring source_file =
+                dec_.source == DecodeState::Source::File ? dec_.file_path : L"";
+            if (!start_audio(true, source_file, &audio_error)) {
+                log_line("decode audio failed: " + audio_error);
+            }
+        }
         log_line("decode started: preset=" + std::string(kPresets[preset_index_].id) +
                  " algo=" + scramble_algorithm_id(kPresets[preset_index_].algorithm) +
                  " color=" + (use_color ? "on" : "off") +
+                 " audio=" + (dec_audio_enabled_ ? audio_algorithm_id(dec_audio_algorithm_)
+                                                 : "off") +
                  " key=" + (public_mode_ ? "public" : "private"));
         return true;
     } catch (const std::exception& e) {
@@ -3560,6 +3878,7 @@ bool GuiApp::Impl::start_decode() {
 
 void GuiApp::Impl::stop_decode() {
     dec_.running = false;
+    stop_audio();
     if (dec_.detector) {
         dec_.detector->stop();
         dec_.detector.reset();
@@ -3693,6 +4012,8 @@ bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
             dec_.key_ok = false;
             dec_.use_color = metadata.use_color();
             dec_.use_dihedral = metadata.use_dihedral();
+            dec_audio_enabled_ = metadata.use_audio();
+            dec_audio_algorithm_ = metadata.audio_algorithm();
             if (const auto* p = preset_by_id(metadata.preset_id)) {
                 const int idx = preset_index_by_id(p->id);
                 if (idx >= 0) preset_index_ = idx;
@@ -3727,6 +4048,14 @@ bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
     }
 
     public_mode_ = want_public;
+    const bool old_audio_enabled = dec_audio_enabled_;
+    const int old_audio_algorithm = dec_audio_algorithm_;
+    dec_audio_enabled_ = metadata.use_audio();
+    dec_audio_algorithm_ = metadata.audio_algorithm();
+    if (dec_.running && (old_audio_enabled != dec_audio_enabled_ ||
+                         old_audio_algorithm != dec_audio_algorithm_)) {
+        restart_decode_audio();
+    }
     if (const auto* p = preset_by_id(metadata.preset_id)) {
         const int idx = preset_index_by_id(p->id);
         if (idx >= 0) preset_index_ = idx;
@@ -3898,6 +4227,11 @@ void GuiApp::Impl::update_decode() {
             dec_.tex_format = DXGI_FORMAT_B8G8R8A8_UNORM;
             dec_.source_w = frame.cols;
             dec_.source_h = frame.rows;
+        }
+        if (audio_engine_.active()) {
+            audio_engine_.set_position_ms(dec_.file.position_ms());
+            audio_engine_.set_playing(!dec_.file.paused());
+            audio_engine_.set_loop(dec_.file.loop());
         }
     } else if (dec_.capture) {
         if (dec_.source == DecodeState::Source::Window &&

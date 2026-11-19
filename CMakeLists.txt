@@ -43,7 +43,11 @@ add_executable(obscure-cli
     src/core/border.cpp
     src/core/transform.cpp
     src/core/detect.cpp
+    src/core/audio_scramble.cpp
+    src/platform/wav_reader.cpp
+    src/platform/wav_writer.cpp
     src/io/ffmpeg_writer.cpp
+    src/io/ffmpeg_audio.cpp
     src/cli/main.cpp
 )
 
@@ -70,7 +74,7 @@ target_link_libraries(obscure-cli PRIVATE
 )
 
 if (MSVC)
-    target_compile_options(obscure-cli PRIVATE /Zi)
+    target_compile_options(obscure-cli PRIVATE /Zi /arch:AVX2)
     target_link_options(obscure-cli PRIVATE /DEBUG)
 endif()
 
@@ -191,12 +195,16 @@ add_executable(obscure-gui
     src/gui/gui_app.cpp
     src/gui/gui_settings.cpp
     src/platform/win_util.cpp
+    src/platform/wasapi_audio.cpp
+    src/platform/wav_reader.cpp
+    src/platform/wav_writer.cpp
     src/core/layout.cpp
     src/core/key.cpp
     src/core/metadata.cpp
     src/core/border.cpp
     src/core/transform.cpp
     src/core/detect.cpp
+    src/core/audio_scramble.cpp
     src/live/wgc_capture.cpp
     src/live/d3d_helpers.cpp
     src/live/shader_path.cpp
@@ -207,9 +215,11 @@ add_executable(obscure-gui
     src/live/spout_sink.cpp
     src/live/file_source.cpp
     src/live/detection_worker.cpp
+    src/live/audio_engine.cpp
     src/live/vcam_sink.cpp
     src/live/vcam_registry.cpp
     src/io/ffmpeg_sink.cpp
+    src/io/ffmpeg_audio.cpp
     ${SPOUT_SOURCES}
 )
 target_compile_definitions(obscure-gui PRIVATE SPOUT_BUILD_STATIC)
@@ -227,9 +237,12 @@ target_link_libraries(obscure-gui PRIVATE
     windowsapp runtimeobject
     mfplat mfreadwrite mfuuid
     opengl32 kernel32 user32 gdi32 winspool comdlg32 comctl32 advapi32 shell32
-    ole32 oleaut32 uuid odbc32 odbccp32 d3d9 version winmm psapi
+    ole32 oleaut32 uuid odbc32 odbccp32 d3d9 version winmm psapi propsys
 )
 add_dependencies(obscure-gui obscure-vcam)
+if (MSVC)
+    target_compile_options(obscure-gui PRIVATE /arch:AVX2)
+endif()
 add_custom_command(TARGET obscure-gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/shaders"
