@@ -295,13 +295,45 @@ int run_selftest() {
             }
         }
 
+        // Public mode must also work with the spatial-curve algorithm.
+        bool public_curve_ok = false;
+        {
+            obs::Layout pub_layout = hilbert_layout;
+            pub_layout.key = obs::kPublicKey;
+            const obs::KeyMaterial pub_key = obs::derive_key(pub_layout);
+            obs::TransportOptions pub_options = hilbert_options;
+            pub_options.public_mode = true;
+            const cv::Mat pub_border =
+                obs::build_border(pub_layout, pub_key, pub_options);
+            const cv::Mat pub_content = obs::obfuscate_content(
+                source, pub_layout, pub_key, 1.0, false, false);
+            const cv::Mat pub_transport =
+                obs::compose_transport(pub_content, pub_border, pub_layout);
+            const cv::Mat pub_reference =
+                obs::make_reference(source, pub_layout, 1.0);
+            const cv::Mat pub_restored = obs::deobfuscate_content(
+                obs::crop_content(pub_transport, pub_layout), pub_layout, pub_key,
+                false, false, 0);
+            const auto pub_det = obs::detect_homography(pub_transport);
+            const auto pub_meta =
+                obs::decode_metadata(pub_transport, pub_det.H, pub_layout);
+            public_curve_ok =
+                cv::norm(pub_restored, pub_reference, cv::NORM_INF) == 0.0 &&
+                pub_meta.has_value() && pub_meta->public_mode() &&
+                pub_meta->algorithm() ==
+                    static_cast<int>(obs::ScrambleAlgorithm::Hilbert) &&
+                pub_meta->key_id == obs::public_key_id() &&
+                pub_key.key_id == obs::public_key_id();
+        }
+
         std::cout << "selftest: exact=" << exact << " maxdiff=" << max_diff
                   << " markers=" << det.marker_count << " h_err=" << det.reproj_error
                   << " metadata=" << meta_ok << " public=" << public_ok
                   << " dihedral=" << dihedral_ok << " color=" << color_ok
-                  << " hilbert=" << hilbert_ok << " curves=" << curves_ok << "\n";
+                  << " hilbert=" << hilbert_ok << " curves=" << curves_ok
+                  << " public_curve=" << public_curve_ok << "\n";
         const bool ok = exact && markers_ok && meta_ok && public_ok && dihedral_ok &&
-                        color_ok && hilbert_ok && curves_ok;
+                        color_ok && hilbert_ok && curves_ok && public_curve_ok;
         std::cout << (ok ? "SELFTEST OK" : "SELFTEST FAILED") << "\n";
         return ok ? 0 : 1;
     } catch (const std::exception& e) {

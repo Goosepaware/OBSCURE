@@ -1481,6 +1481,13 @@ void GuiApp::Impl::draw_presets() {
     }
     ImGui::EndDisabled();
 
+    ImGui::BeginDisabled(enc_.running);
+    ImGui::Checkbox("无密钥模式（公开视频）", &public_mode_);
+    ImGui::EndDisabled();
+    if (public_mode_) {
+        ImGui::TextDisabled("内置公开密钥，任何 OBScure 都能解码。");
+    }
+
     ImGui::TextDisabled("画质档位");
     ImGui::BeginDisabled(enc_.running);
     const char* preview = kPresets[preset_index_].label;
@@ -1508,10 +1515,6 @@ void GuiApp::Impl::draw_presets() {
 
 void GuiApp::Impl::draw_key() {
     ImGui::TextDisabled("共享密钥");
-    ImGui::BeginDisabled(enc_.running);
-    ImGui::Checkbox("无密钥模式（公开视频）", &public_mode_);
-    ImGui::EndDisabled();
-
     ImGui::BeginDisabled(enc_.running || public_mode_);
     ImGui::SetNextItemWidth(168);
     ImGui::InputText("##key", key_buf_, sizeof(key_buf_),
