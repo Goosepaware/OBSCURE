@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -33,7 +34,9 @@ void usage() {
         << "  obscure-cli decode --input out.mp4 --output restored.mp4 [options]\n\n"
         << "Options:\n"
         << "  --config NAME        c32_g2_s120 (default), c32_g2_s100, c32_g2_s140,\n"
-        << "                       c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120\n"
+        << "                       c16_g2_s100, c16_g1_s100, c64_g2_s100, c64_g2_s120,\n"
+        << "                       h8_g0_s100, h16_g0_s100, h32_g0_s100\n"
+        << "  --algo grid|hilbert  scrambling algorithm (hilbert = spatial curve)\n"
         << "  --bitrate N          encode CBR Mbps (default 8)\n"
         << "  --key TEXT           shared key (default obscure-demo-key)\n"
         << "  --public             use the built-in public key (no secret needed)\n"
@@ -191,12 +194,114 @@ int run_selftest() {
             public_meta->preset_id == 6 && public_meta->scale_x10 == 10 &&
             public_meta->key_id == public_key.key_id;
 
+        // Spatial-curve algorithm: full-frame, guard-free, upright tiles. The
+        // curve must be a true permutation and the CPU round trip must be exact.
+        obs::Layout hilbert_layout = layout;
+        hilbert_layout.cell = 16;
+        hilbert_layout.guard = 0;
+        hilbert_layout.algorithm = static_cast<int>(obs::ScrambleAlgorithm::Hilbert);
+        hilbert_layout.validate();
+        const obs::KeyMaterial hilbert_key = obs::derive_key(hilbert_layout);
+        std::vector<int> seen(static_cast<size_t>(hilbert_layout.blocks()), 0);
+        bool perm_ok = true;
+        for (int32_t v : hilbert_key.perm) {
+            if (v < 0 || v >= hilbert_layout.blocks() ||
+                seen[static_cast<size_t>(v)] != 0) {
+                perm_ok = false;
+                break;
+            }
+            seen[static_cast<size_t>(v)] = 1;
+        }
+        const std::vector<int32_t> curve =
+            obs::hilbert_curve_order(hilbert_layout.cols(), hilbert_layout.rows());
+        std::fill(seen.begin(), seen.end(), 0);
+        bool curve_ok = static_cast<int>(curve.size()) == hilbert_layout.blocks();
+        for (int32_t v : curve) {
+            if (!curve_ok || v < 0 || v >= hilbert_layout.blocks() ||
+                seen[static_cast<size_t>(v)] != 0) {
+                curve_ok = false;
+                break;
+            }
+            seen[static_cast<size_t>(v)] = 1;
+        }
+
+        obs::TransportOptions hilbert_options;
+        hilbert_options.use_color = false;
+        hilbert_options.use_dihedral = false;
+        hilbert_options.preset_id = obs::preset_index_by_id("h16_g0_s100") + 1;
+        hilbert_options.scale_x10 = 10;
+        hilbert_options.algorithm = static_cast<int>(obs::ScrambleAlgorithm::Hilbert);
+        const cv::Mat hilbert_border =
+            obs::build_border(hilbert_layout, hilbert_key, hilbert_options);
+        const cv::Mat hilbert_content = obs::obfuscate_content(
+            source, hilbert_layout, hilbert_key, 1.0, false, false);
+        const cv::Mat hilbert_transport =
+            obs::compose_transport(hilbert_content, hilbert_border, hilbert_layout);
+        const cv::Mat hilbert_reference =
+            obs::make_reference(source, hilbert_layout, 1.0);
+        const cv::Mat hilbert_restored = obs::deobfuscate_content(
+            obs::crop_content(hilbert_transport, hilbert_layout), hilbert_layout,
+            hilbert_key, false, false, 0);
+        const double hilbert_diff =
+            cv::norm(hilbert_restored, hilbert_reference, cv::NORM_INF);
+        const auto hilbert_det = obs::detect_homography(hilbert_transport);
+        const auto hilbert_meta =
+            obs::decode_metadata(hilbert_transport, hilbert_det.H, hilbert_layout);
+        const bool hilbert_ok =
+            perm_ok && curve_ok && hilbert_diff == 0.0 && hilbert_meta.has_value() &&
+            hilbert_meta->algorithm() ==
+                static_cast<int>(obs::ScrambleAlgorithm::Hilbert) &&
+            !hilbert_meta->use_color() && !hilbert_meta->use_dihedral() &&
+            hilbert_meta->preset_id == hilbert_options.preset_id;
+
+        // Verify every spatial-curve preset produces a true permutation.
+        bool curves_ok = true;
+        for (const char* id : {"h8_g0_s100", "h16_g0_s100", "h32_g0_s100"}) {
+            const int pi = obs::preset_index_by_id(id);
+            if (pi < 0) {
+                curves_ok = false;
+                continue;
+            }
+            const auto& p = obs::kPresets[pi];
+            obs::Layout curve_layout = layout;
+            curve_layout.cell = p.cell;
+            curve_layout.guard = p.guard;
+            curve_layout.algorithm = p.algorithm;
+            const auto order =
+                obs::hilbert_curve_order(curve_layout.cols(), curve_layout.rows());
+            bool ok = static_cast<int>(order.size()) == curve_layout.blocks();
+            std::vector<int> used(static_cast<size_t>(curve_layout.blocks()), 0);
+            for (int32_t v : order) {
+                if (!ok || v < 0 || v >= curve_layout.blocks() ||
+                    used[static_cast<size_t>(v)] != 0) {
+                    ok = false;
+                    break;
+                }
+                used[static_cast<size_t>(v)] = 1;
+            }
+            const obs::KeyMaterial pkey = obs::derive_key(curve_layout);
+            std::fill(used.begin(), used.end(), 0);
+            for (int32_t v : pkey.perm) {
+                if (!ok || v < 0 || v >= curve_layout.blocks() ||
+                    used[static_cast<size_t>(v)] != 0) {
+                    ok = false;
+                    break;
+                }
+                used[static_cast<size_t>(v)] = 1;
+            }
+            if (!ok) {
+                curves_ok = false;
+                std::cout << "  curve fail preset=" << id << "\n";
+            }
+        }
+
         std::cout << "selftest: exact=" << exact << " maxdiff=" << max_diff
                   << " markers=" << det.marker_count << " h_err=" << det.reproj_error
                   << " metadata=" << meta_ok << " public=" << public_ok
-                  << " dihedral=" << dihedral_ok << " color=" << color_ok << "\n";
-        const bool ok =
-            exact && markers_ok && meta_ok && public_ok && dihedral_ok && color_ok;
+                  << " dihedral=" << dihedral_ok << " color=" << color_ok
+                  << " hilbert=" << hilbert_ok << " curves=" << curves_ok << "\n";
+        const bool ok = exact && markers_ok && meta_ok && public_ok && dihedral_ok &&
+                        color_ok && hilbert_ok && curves_ok;
         std::cout << (ok ? "SELFTEST OK" : "SELFTEST FAILED") << "\n";
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
@@ -228,9 +333,13 @@ int main(int argc, char** argv) {
     const auto args = parse_args(argc, argv);
     const std::string input = get(args, "input", "");
     const std::string output = get(args, "output", "");
-    const std::string config = get(args, "config", "c32_g2_s120");
+    const std::string algo_arg = get(args, "algo", "");
+    const std::string config =
+        get(args, "config", algo_arg == "hilbert" || args.count("hilbert")
+                                ? "h16_g0_s100"
+                                : "c32_g2_s120");
     const bool public_key = args.find("public") != args.end();
-    const bool use_color = args.find("no-color") == args.end();
+    const bool use_color_arg = args.find("no-color") == args.end();
     const std::string key_text =
         public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
     const std::string ffmpeg = get(args, "ffmpeg", default_ffmpeg());
@@ -255,23 +364,29 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unknown config: " + config);
         }
         const obs::Preset& preset = obs::kPresets[preset_index];
+        const bool hilbert = preset.algorithm != 0;
+        const bool use_color = hilbert ? false : use_color_arg;
+        const bool use_dihedral = !hilbert;
 
         obs::Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
+        layout.algorithm = preset.algorithm;
         layout.key = key_text;
         layout.validate();
         const obs::KeyMaterial key = obs::derive_key(layout);
         obs::TransportOptions options;
         options.use_color = use_color;
-        options.use_dihedral = true;
+        options.use_dihedral = use_dihedral;
         options.public_mode = public_key;
         options.preset_id = preset_index + 1;
         options.scale_x10 = obs::preset_scale_x10(preset);
+        options.algorithm = preset.algorithm;
         const cv::Mat border = obs::build_border(layout, key, options);
 
         std::cout << "[config] " << config << " cell=" << layout.cell
                   << " guard=" << layout.guard << " scale=" << preset.scale
+                  << " algo=" << obs::scramble_algorithm_id(layout.algorithm)
                   << " grid=" << layout.cols() << "x" << layout.rows()
                   << " ref=" << layout.ref_w() << "x" << layout.ref_h()
                   << " key=" << std::hex << std::uppercase << key.key_id << std::dec
@@ -326,7 +441,7 @@ int main(int argc, char** argv) {
             if (mode == "encode") {
                 cv::Mat content =
                     obs::obfuscate_content(frame, layout, key, preset.scale,
-                                           use_color, true);
+                                           use_color, use_dihedral);
                 cv::Mat transport = obs::compose_transport(content, border, layout);
                 if (write_output && !writer.write(transport)) {
                     throw std::runtime_error(writer.error());
@@ -358,6 +473,7 @@ int main(int argc, char** argv) {
                                           << " color=" << (md->use_color() ? 1 : 0)
                                           << " dihedral="
                                           << (md->use_dihedral() ? 1 : 0)
+                                          << " algo=" << md->algorithm()
                                           << " preset=" << md->preset_id
                                           << " scale_x10=" << md->scale_x10
                                           << " cell=" << md->cell
@@ -386,8 +502,8 @@ int main(int argc, char** argv) {
 
                 cv::Mat canonical = obs::warp_to_canonical(frame, H, layout);
                 cv::Mat restored = obs::deobfuscate_content(
-                    obs::crop_content(canonical, layout), layout, key, use_color, true,
-                    margin);
+                    obs::crop_content(canonical, layout), layout, key, use_color,
+                    use_dihedral, margin);
                 if (write_output && !writer.write(restored)) {
                     throw std::runtime_error(writer.error());
                 }

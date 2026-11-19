@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "core/key.h"
 #include "core/metadata.h"
 #include "core/presets.h"
 
@@ -84,7 +85,8 @@ cv::Mat build_border(
     }
     label << "OBSCure v1  " << layout.content_w << "x" << layout.content_h
           << "  cell " << layout.cell << " guard " << layout.guard << "  "
-          << preset_id << "  color " << (options.use_color ? "on" : "off")
+          << preset_id << "  " << scramble_algorithm_id(layout.algorithm) << "  color "
+          << (options.use_color ? "on" : "off")
           << "  " << (options.public_mode ? "public" : "key") << " "
           << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
           << key.key_id;

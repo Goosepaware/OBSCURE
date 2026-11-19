@@ -91,6 +91,7 @@ std::vector<int> build_metadata_bits(
     if (options.use_dihedral) flags |= 0x02;
     if (options.scale_x10 > 10) flags |= 0x04;
     if (options.public_mode) flags |= 0x08;
+    if (options.algorithm == 1) flags |= 0x10;
 
     BitWriter bw;
     bw.write(0xB5C3, 16);
@@ -186,6 +187,7 @@ std::optional<Layout> layout_from_metadata(const Metadata& metadata) {
     layout.content_h = metadata.content_h;
     layout.cell = metadata.cell;
     layout.guard = metadata.guard;
+    layout.algorithm = metadata.algorithm();
     return layout;
 }
 

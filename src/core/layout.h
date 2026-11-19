@@ -18,6 +18,7 @@ struct Layout {
     int content_h = 896;
     int cell = 32;
     int guard = 2;
+    int algorithm = 0;  // 0 = classic grid, 1 = Hilbert spatial curve
     std::string key = "obscure-demo-key";
 
     int cols() const { return content_w / cell; }

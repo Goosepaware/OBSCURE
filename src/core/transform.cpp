@@ -192,7 +192,7 @@ cv::Mat deobfuscate_content(const cv::Mat& content, const Layout& layout,
     const int inner = layout.inner();
     const int cell = layout.cell;
     const int sample = inner - 2 * margin;
-    if (sample < 8) {
+    if (sample < 4) {
         throw std::runtime_error("decoder margin too large");
     }
     const int g = layout.guard + margin;

@@ -650,6 +650,18 @@ void GuiApp::Impl::parse_command_line() {
             for (int j = 0; j < kPresetCount; ++j) {
                 if (id == kPresets[j].id) preset_index_ = j;
             }
+        } else if (arg == L"--algo" && i + 1 < argc) {
+            const int algorithm =
+                scramble_algorithm_from_id(wide_to_utf8(argv[++i]));
+            preset_index_ = default_preset_for_algorithm(algorithm);
+            if (algorithm == 1) {
+                enc_use_color_ = false;
+                dec_.use_color = false;
+            }
+        } else if (arg == L"--hilbert") {
+            preset_index_ = default_preset_for_algorithm(1);
+            enc_use_color_ = false;
+            dec_.use_color = false;
         } else if (arg == L"--key" && i + 1 < argc) {
             const std::string text = wide_to_utf8(argv[++i]);
             strncpy_s(key_buf_, text.c_str(), _TRUNCATE);
@@ -1312,10 +1324,16 @@ void GuiApp::Impl::draw_encode() {
     ImGui::Separator();
     draw_presets();
     ImGui::Separator();
-    ImGui::BeginDisabled(enc_.running);
+    const bool hilbert = kPresets[preset_index_].algorithm != 0;
+    ImGui::BeginDisabled(enc_.running || hilbert);
     ImGui::Checkbox("颜色混淆", &enc_use_color_);
     ImGui::EndDisabled();
-    ImGui::TextWrapped("关闭后保留原色；\n位置/翻转混淆仍启用。");
+    if (hilbert) {
+        enc_use_color_ = false;
+        ImGui::TextWrapped("空间曲线模式固定保留原色，\n以维持块间亮度/色度连续。");
+    } else {
+        ImGui::TextWrapped("关闭后保留原色；\n位置/翻转混淆仍启用。");
+    }
     ImGui::Separator();
     draw_key();
     draw_export_ui(false);
@@ -1450,11 +1468,25 @@ void GuiApp::Impl::draw_encode_outputs() {
 }
 
 void GuiApp::Impl::draw_presets() {
+    ImGui::TextDisabled("混淆算法");
+    ImGui::BeginDisabled(enc_.running);
+    int algorithm = kPresets[preset_index_].algorithm;
+    const char* algorithms[] = {"经典网格（强混淆）", "空间曲线（高画质）"};
+    if (ImGui::Combo("##algorithm", &algorithm, algorithms, 2)) {
+        preset_index_ = default_preset_for_algorithm(algorithm);
+        if (algorithm == 1) {
+            enc_use_color_ = false;
+            dec_.use_color = false;
+        }
+    }
+    ImGui::EndDisabled();
+
     ImGui::TextDisabled("画质档位");
     ImGui::BeginDisabled(enc_.running);
     const char* preview = kPresets[preset_index_].label;
     if (ImGui::BeginCombo("##preset", preview)) {
         for (int i = 0; i < kPresetCount; ++i) {
+            if (kPresets[i].algorithm != kPresets[preset_index_].algorithm) continue;
             const std::string label =
                 std::string(kPresets[i].label) + "  (" + kPresets[i].id + ")";
             if (ImGui::Selectable(label.c_str(), i == preset_index_)) {
@@ -1467,7 +1499,11 @@ void GuiApp::Impl::draw_presets() {
     const auto& p = kPresets[preset_index_];
     ImGui::TextDisabled("cell %d · guard %d · scale %.1fx", p.cell, p.guard, p.scale);
     ImGui::TextDisabled("建议码率 %d Mbps", p.bitrate);
-    ImGui::TextWrapped("本阶段固定算法，画质/码率后续再调。");
+    if (p.algorithm == 0) {
+        ImGui::TextWrapped("保护边 + 随机翻转：抗还原最强，码率开销较大。");
+    } else {
+        ImGui::TextWrapped("满屏无黑边，微块不旋转：保留运动特征，画质明显更清晰。");
+    }
 }
 
 void GuiApp::Impl::draw_key() {
@@ -1659,7 +1695,14 @@ void GuiApp::Impl::draw_decode() {
     ImGui::Separator();
     draw_presets();
     ImGui::Separator();
+    const bool hilbert = kPresets[preset_index_].algorithm != 0;
+    if (hilbert) dec_.use_color = false;
+    ImGui::BeginDisabled(hilbert);
     ImGui::Checkbox("颜色还原", &dec_.use_color);
+    ImGui::EndDisabled();
+    if (hilbert) {
+        ImGui::TextWrapped("空间曲线模式不使用颜色混淆。");
+    }
     ImGui::Checkbox("自动匹配视频设置", &auto_match_settings_);
     draw_video_info();
     ImGui::TextWrapped("修改档位/密钥/颜色后，\n点“应用设置”立即生效。");
@@ -2219,9 +2262,11 @@ bool GuiApp::Impl::start_export(bool for_decode) {
 
     if (!for_decode) {
         const Preset& preset = kPresets[preset_index_];
+        const bool hilbert = preset.algorithm != 0;
         Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
+        layout.algorithm = preset.algorithm;
         if (!public_mode_ && key_buf_[0] == '\0') {
             set_error("密钥不能为空。");
             return false;
@@ -2231,13 +2276,14 @@ bool GuiApp::Impl::start_export(bool for_decode) {
         const KeyMaterial key = derive_key(layout);
         state.layout = layout;
         state.key = key;
-        state.use_color = enc_use_color_;
-        state.use_dihedral = true;
-        state.transport.use_color = enc_use_color_;
-        state.transport.use_dihedral = true;
+        state.use_color = hilbert ? false : enc_use_color_;
+        state.use_dihedral = !hilbert;
+        state.transport.use_color = state.use_color;
+        state.transport.use_dihedral = state.use_dihedral;
         state.transport.public_mode = public_mode_;
         state.transport.preset_id = preset_index_ + 1;
         state.transport.scale_x10 = preset_scale_x10(preset);
+        state.transport.algorithm = preset.algorithm;
         state.encoder = std::make_unique<EncodePipeline>();
         if (!state.encoder->init(device_.Get(), context_.Get(), layout, key,
                                  preset.scale, state.transport,
@@ -2259,11 +2305,12 @@ bool GuiApp::Impl::start_export(bool for_decode) {
         Layout layout;
         layout.cell = kPresets[preset_index_].cell;
         layout.guard = kPresets[preset_index_].guard;
+        layout.algorithm = kPresets[preset_index_].algorithm;
         layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         layout.validate();
         KeyMaterial key = derive_key(layout);
-        bool use_color = dec_.use_color;
-        bool use_dihedral = dec_.use_dihedral;
+        bool use_color = layout.algorithm == 0 ? dec_.use_color : false;
+        bool use_dihedral = layout.algorithm == 0;
         std::optional<Metadata> applied_meta;
 
         const cv::Mat identity = identity_scaled(first.cols, first.rows);
@@ -2291,7 +2338,8 @@ bool GuiApp::Impl::start_export(bool for_decode) {
                 const int idx = preset_index_by_id(p->id);
                 if (idx >= 0) preset_index_ = idx;
             } else {
-                const int idx = preset_index_by_geometry(md.cell, md.guard, md.scale_x10);
+                const int idx = preset_index_by_geometry(md.cell, md.guard, md.scale_x10,
+                                                         md.algorithm());
                 if (idx >= 0) preset_index_ = idx;
             }
             if (!md.public_mode() && md.key_id != key.key_id) {
@@ -2762,6 +2810,8 @@ void GuiApp::Impl::draw_video_info() {
             info << scale_buf;
         }
     }
+    info << "\n算法："
+         << (m.algorithm() == 1 ? "空间曲线（无黑边/不旋转）" : "经典网格");
     info << (m.use_color() ? " · 颜色混淆 开" : " · 颜色混淆 关");
     ImGui::TextWrapped("%s", info.str().c_str());
     if (!m.public_mode() && m.key_id != dec_.key.key_id) {
@@ -3058,18 +3108,21 @@ bool GuiApp::Impl::start_encode() {
             return false;
         }
         const Preset& preset = kPresets[preset_index_];
+        const bool hilbert = preset.algorithm != 0;
         Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
+        layout.algorithm = preset.algorithm;
         layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         layout.validate();
         const KeyMaterial key = derive_key(layout);
         TransportOptions options;
-        options.use_color = enc_use_color_;
-        options.use_dihedral = true;
+        options.use_color = hilbert ? false : enc_use_color_;
+        options.use_dihedral = !hilbert;
         options.public_mode = public_mode_;
         options.preset_id = preset_index_ + 1;
         options.scale_x10 = preset_scale_x10(preset);
+        options.algorithm = preset.algorithm;
 
         auto encoder = std::make_unique<EncodePipeline>();
         std::string error;
@@ -3201,7 +3254,11 @@ bool GuiApp::Impl::start_encode() {
         enc_.fps = 0.0;
         enc_.stat_start = Clock::now();
         enc_.running = true;
-        log_line("encode started: " + std::string(preset.id));
+        log_line("encode started: " + std::string(preset.id) + " algo=" +
+                 scramble_algorithm_id(preset.algorithm) +
+                 " color=" + ((kPresets[preset_index_].algorithm == 0 && enc_use_color_)
+                                  ? "on"
+                                  : "off"));
         return true;
     } catch (const std::exception& e) {
         set_error(std::string("启动编码失败: ") + e.what());
@@ -3324,14 +3381,16 @@ bool GuiApp::Impl::start_decode() {
             public_mode_ = true;
         }
         const Preset& preset = kPresets[preset_index_];
+        const bool hilbert = preset.algorithm != 0;
         Layout layout;
         layout.cell = preset.cell;
         layout.guard = preset.guard;
+        layout.algorithm = preset.algorithm;
         layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
         layout.validate();
         KeyMaterial key = derive_key(layout);
-        bool use_color = dec_.use_color;
-        bool use_dihedral = true;
+        bool use_color = hilbert ? false : dec_.use_color;
+        bool use_dihedral = !hilbert;
 
         auto fail = [this](const std::string& message) {
             set_error(message);
@@ -3393,7 +3452,8 @@ bool GuiApp::Impl::start_decode() {
                             if (idx >= 0) preset_index_ = idx;
                         } else {
                             const int idx = preset_index_by_geometry(
-                                metadata->cell, metadata->guard, metadata->scale_x10);
+                                metadata->cell, metadata->guard, metadata->scale_x10,
+                                metadata->algorithm());
                             if (idx >= 0) preset_index_ = idx;
                         }
                         dec_.metadata_applied = true;
@@ -3484,6 +3544,7 @@ bool GuiApp::Impl::start_decode() {
         dec_.stat_start = Clock::now();
         dec_.running = true;
         log_line("decode started: preset=" + std::string(kPresets[preset_index_].id) +
+                 " algo=" + scramble_algorithm_id(kPresets[preset_index_].algorithm) +
                  " color=" + (use_color ? "on" : "off") +
                  " key=" + (public_mode_ ? "public" : "private"));
         return true;
@@ -3634,7 +3695,8 @@ bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
                 if (idx >= 0) preset_index_ = idx;
             } else {
                 const int idx = preset_index_by_geometry(metadata.cell, metadata.guard,
-                                                         metadata.scale_x10);
+                                                         metadata.scale_x10,
+                                                         metadata.algorithm());
                 if (idx >= 0) preset_index_ = idx;
             }
             char buf[160]{};
@@ -3667,7 +3729,8 @@ bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
         if (idx >= 0) preset_index_ = idx;
     } else {
         const int idx = preset_index_by_geometry(metadata.cell, metadata.guard,
-                                                 metadata.scale_x10);
+                                                 metadata.scale_x10,
+                                                 metadata.algorithm());
         if (idx >= 0) preset_index_ = idx;
     }
 
@@ -3683,6 +3746,7 @@ bool GuiApp::Impl::apply_video_metadata(const Metadata& metadata, bool force) {
              std::string(preset_by_id(metadata.preset_id)
                              ? preset_by_id(metadata.preset_id)->id
                              : "custom") +
+             " algo=" + scramble_algorithm_id(metadata.algorithm()) +
              " color=" + (metadata.use_color() ? "on" : "off") +
              " key=" + (want_public ? "public" : "private"));
     return true;
@@ -3695,14 +3759,18 @@ bool GuiApp::Impl::apply_manual_decode_settings() {
         return false;
     }
     const Preset& preset = kPresets[preset_index_];
+    const bool hilbert = preset.algorithm != 0;
     Layout layout;
     layout.cell = preset.cell;
     layout.guard = preset.guard;
+    layout.algorithm = preset.algorithm;
     layout.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
     layout.validate();
     if (margin_override_ < 0) {
         dec_.margin = adaptive_margin(dec_.H, layout.cell);
     }
+    if (hilbert) dec_.use_color = false;
+    dec_.use_dihedral = !hilbert;
     const KeyMaterial key = derive_key(layout);
     std::string error;
     if (!create_decode_pipeline(layout, key, dec_.use_color, dec_.use_dihedral, &error)) {

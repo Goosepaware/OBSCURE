@@ -14,6 +14,7 @@ struct TransportOptions {
     bool public_mode = false;
     int preset_id = 0;   // 1-based stable preset id, 0 = custom/unknown
     int scale_x10 = 0;   // 0 = unknown, otherwise 10/12/14...
+    int algorithm = 0;   // 0 = classic grid, 1 = Hilbert spatial curve
 };
 
 struct Metadata {
@@ -39,6 +40,7 @@ struct Metadata {
     bool use_dihedral() const { return (flags & 0x02) != 0; }
     bool extra_scaled() const { return (flags & 0x04) != 0; }
     bool public_mode() const { return (flags & 0x08) != 0; }
+    int algorithm() const { return (flags & 0x10) != 0 ? 1 : 0; }
 };
 
 uint16_t crc16_ccitt(const uint8_t* data, size_t size);
