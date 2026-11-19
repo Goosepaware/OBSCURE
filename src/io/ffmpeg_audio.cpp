@@ -66,7 +66,7 @@ bool audio_extract_wav(const std::wstring& ffmpeg, const std::wstring& input,
 bool audio_process_to_wav(const std::wstring& ffmpeg, const std::wstring& input,
                           const std::wstring& wav,
                           const AudioScrambleParams& params, int sample_rate,
-                          std::string* error) {
+                          std::string* error, bool scramble) {
     const std::wstring temp = wav + L".src.wav";
     if (!audio_extract_wav(ffmpeg, input, temp, error)) return false;
 
@@ -82,7 +82,7 @@ bool audio_process_to_wav(const std::wstring& ffmpeg, const std::wstring& input,
         return false;
     }
     AudioScrambler scrambler;
-    if (!scrambler.configure(sample_rate, params, error)) {
+    if (scramble && !scrambler.configure(sample_rate, params, error)) {
         reader.close();
         writer.close();
         DeleteFileW(temp.c_str());
@@ -96,7 +96,12 @@ bool audio_process_to_wav(const std::wstring& ffmpeg, const std::wstring& input,
     for (;;) {
         const int got = reader.read(in_buf.data(), kBlock);
         if (got <= 0) break;
-        scrambler.process(in_buf.data(), out_buf.data(), got);
+        if (scramble) {
+            scrambler.process(in_buf.data(), out_buf.data(), got);
+        } else {
+            std::copy(in_buf.begin(), in_buf.begin() + static_cast<size_t>(got) * 2,
+                      out_buf.begin());
+        }
         if (!writer.write(out_buf.data(), got)) {
             ok = false;
             break;

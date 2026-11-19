@@ -7,6 +7,7 @@ namespace obs {
 
 struct AudioEngineConfig {
     bool decode_mode = false;
+    bool scramble = true;
     int algorithm = 0;
     std::string key;
     std::wstring output_device_id;  // empty = system default, L"none" = muted

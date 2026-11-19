@@ -2687,7 +2687,7 @@ void GuiApp::Impl::finish_export(bool cancelled) {
         if (!export_.sink->error().empty()) export_.error = export_.sink->error();
         export_.sink.reset();
     }
-    if (!cancelled && export_.error.empty() && export_.audio_enabled &&
+    if (!cancelled && export_.error.empty() &&
         !export_.source_path.empty() && !export_.output_path.empty() &&
         fs::exists(export_.output_path)) {
         const auto stamp =
@@ -2701,7 +2701,7 @@ void GuiApp::Impl::finish_export(bool cancelled) {
         if (export_.for_decode) params = inverse_audio_params(params);
         if (audio_process_to_wav(ffmpeg_tool_path(), export_.source_path,
                                  temp.wstring(), params, 48000,
-                                 &audio_error)) {
+                                 &audio_error, export_.audio_enabled)) {
             const fs::path out(export_.output_path);
             const fs::path muxed =
                 out.parent_path() /
@@ -3290,7 +3290,6 @@ bool GuiApp::Impl::start_audio(bool decode_mode, const std::wstring& file_path,
     audio_source_wav_.clear();
     audio_record_wav_.clear();
     const bool enabled = decode_mode ? dec_audio_enabled_ : enc_audio_enabled_;
-    if (!enabled) return true;
     const int algorithm = decode_mode ? dec_audio_algorithm_ : enc_audio_algorithm_;
 
     std::wstring source_wav;
@@ -3318,6 +3317,7 @@ bool GuiApp::Impl::start_audio(bool decode_mode, const std::wstring& file_path,
 
     AudioEngineConfig config;
     config.decode_mode = decode_mode;
+    config.scramble = enabled;
     config.algorithm = algorithm;
     config.key = public_mode_ ? std::string(kPublicKey) : std::string(key_buf_);
     config.output_device_id = audio_device_id();
@@ -3336,7 +3336,7 @@ bool GuiApp::Impl::start_audio(bool decode_mode, const std::wstring& file_path,
     }
     log_line(std::string("audio started: ") +
              (decode_mode ? "decode/" : "encode/") +
-             audio_algorithm_id(algorithm) +
+             (config.scramble ? audio_algorithm_id(algorithm) : "passthrough") +
              (source_wav.empty() ? " loopback" : " file"));
     return true;
 }
@@ -3539,7 +3539,7 @@ bool GuiApp::Impl::start_encode() {
             enc_.recorder = std::move(recorder);
         }
 
-        if (enc_audio_enabled_) {
+        {
             std::string audio_error;
             const std::wstring source_file =
                 enc_.source == EncodeState::Source::File ? enc_.file_path : L"";
@@ -3560,7 +3560,7 @@ bool GuiApp::Impl::start_encode() {
                                   : "off") +
                  " audio=" + (enc_audio_enabled_
                                   ? audio_algorithm_id(enc_audio_algorithm_)
-                                  : "off"));
+                                  : "passthrough"));
         return true;
     } catch (const std::exception& e) {
         set_error(std::string("启动编码失败: ") + e.what());
@@ -3854,7 +3854,7 @@ bool GuiApp::Impl::start_decode() {
         dec_.fps = 0.0;
         dec_.stat_start = Clock::now();
         dec_.running = true;
-        if (dec_audio_enabled_) {
+        {
             std::string audio_error;
             const std::wstring source_file =
                 dec_.source == DecodeState::Source::File ? dec_.file_path : L"";
@@ -3866,7 +3866,7 @@ bool GuiApp::Impl::start_decode() {
                  " algo=" + scramble_algorithm_id(kPresets[preset_index_].algorithm) +
                  " color=" + (use_color ? "on" : "off") +
                  " audio=" + (dec_audio_enabled_ ? audio_algorithm_id(dec_audio_algorithm_)
-                                                 : "off") +
+                                                 : "passthrough") +
                  " key=" + (public_mode_ ? "public" : "private"));
         return true;
     } catch (const std::exception& e) {

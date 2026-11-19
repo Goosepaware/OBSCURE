@@ -657,7 +657,7 @@ int main(int argc, char** argv) {
         if (!output.empty()) ensure_parent(output);
         obs::FfmpegWriter writer;
         const bool write_output = !output.empty();
-        const bool audio_active = audio_enabled && write_output;
+        const bool audio_active = write_output;
         const fs::path final_path = write_output ? fs::path(output) : fs::path();
         fs::path video_path = final_path;
         fs::path audio_wav;
@@ -798,7 +798,7 @@ int main(int argc, char** argv) {
             const std::wstring ffmpeg_w = fs::path(ffmpeg).wstring();
             bool audio_ok = obs::audio_process_to_wav(
                 ffmpeg_w, fs::path(input).wstring(), audio_wav.wstring(),
-                audio_params, 48000, &audio_error);
+                audio_params, 48000, &audio_error, audio_enabled);
             if (audio_ok) {
                 audio_ok = obs::audio_mux(ffmpeg_w, video_path.wstring(),
                                           audio_wav.wstring(),
@@ -807,10 +807,14 @@ int main(int argc, char** argv) {
             }
             std::error_code ec;
             if (audio_ok) {
-                std::cout << "[audio] muxed "
-                          << (mode == "decode" ? "inverse/" : "")
-                          << obs::audio_algorithm_id(audio_algorithm) << " into "
-                          << output << "\n";
+                std::string audio_label = "passthrough";
+                if (audio_enabled) {
+                    if (mode == "decode") audio_label = "inverse/";
+                    else audio_label.clear();
+                    audio_label += obs::audio_algorithm_id(audio_algorithm);
+                }
+                std::cout << "[audio] muxed " << audio_label << " into " << output
+                          << "\n";
             } else {
                 std::cerr << "[warn] audio mux skipped: " << audio_error << "\n";
                 fs::copy_file(video_path, final_path,

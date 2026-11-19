@@ -80,7 +80,13 @@ struct AudioEngine::Impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-            scrambler.process(in_buf.data(), out_buf.data(), got);
+            if (config.scramble) {
+                scrambler.process(in_buf.data(), out_buf.data(), got);
+            } else {
+                std::copy(in_buf.begin(),
+                          in_buf.begin() + static_cast<size_t>(got) * 2,
+                          out_buf.begin());
+            }
             apply_volume(out_buf.data(), got);
             deliver(out_buf.data(), got);
             engine_ms = engine_ms.load() + static_cast<double>(got) / 48.0;
@@ -103,7 +109,13 @@ struct AudioEngine::Impl {
         self->out_buf.resize(static_cast<size_t>(frames) * 2);
         std::copy(data, data + static_cast<size_t>(frames) * 2,
                   self->in_buf.begin());
-        self->scrambler.process(self->in_buf.data(), self->out_buf.data(), frames);
+        if (self->config.scramble) {
+            self->scrambler.process(self->in_buf.data(), self->out_buf.data(),
+                                    frames);
+        } else {
+            std::copy(self->in_buf.begin(), self->in_buf.end(),
+                      self->out_buf.begin());
+        }
         self->apply_volume(self->out_buf.data(), frames);
         self->deliver(self->out_buf.data(), frames);
     }
@@ -127,7 +139,10 @@ bool AudioEngine::start(const AudioEngineConfig& config, std::string* error) {
     AudioScrambleParams params =
         derive_audio_params(config.key, config.algorithm);
     if (config.decode_mode) params = inverse_audio_params(params);
-    if (!impl_->scrambler.configure(48000, params, error)) return false;
+    if (config.scramble &&
+        !impl_->scrambler.configure(48000, params, error)) {
+        return false;
+    }
 
     if (config.output_device_id != L"none") {
         impl_->render = std::make_unique<WasapiRender>();

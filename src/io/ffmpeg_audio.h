@@ -16,7 +16,7 @@ bool audio_extract_wav(const std::wstring& ffmpeg, const std::wstring& input,
 bool audio_process_to_wav(const std::wstring& ffmpeg, const std::wstring& input,
                           const std::wstring& wav,
                           const AudioScrambleParams& params, int sample_rate,
-                          std::string* error);
+                          std::string* error, bool scramble = true);
 
 // Mux a video file and a WAV into the output, copying the video stream and
 // encoding the audio as AAC.
