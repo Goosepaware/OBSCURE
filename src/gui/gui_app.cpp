@@ -474,6 +474,7 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void apply_console_rect();
     void place_preview_to_right();
     void update_detached_preview();
+    void update_preview_player();
     bool start_export(bool for_decode);
     void update_export();
     void finish_export(bool cancelled);
@@ -565,6 +566,7 @@ int GuiApp::Impl::run() {
         }
         if (picker_open_) update_picker_preview();
         if (export_.running) update_export();
+        update_preview_player();
         update_detached_preview();
 
         if (!IsIconic(hwnd_) && win_w_ > 0 && win_h_ > 0) {
@@ -1392,7 +1394,6 @@ void GuiApp::Impl::draw_encode_source() {
     }
     ImGui::EndDisabled();
     ImGui::TextWrapped("窗口捕获需要窗口可见。\n独占全屏游戏建议用无边框模式。");
-    draw_player_bar(false);
 }
 
 void GuiApp::Impl::draw_encode_outputs() {
@@ -1564,7 +1565,10 @@ void GuiApp::Impl::draw_encode_preview() {
     } else {
         label = "等待输入源";
     }
-    draw_image_fit(srv, width, height, label.c_str(), 52.0f);
+    const bool has_player =
+        enc_.source == EncodeState::Source::File && enc_.file.is_open();
+    draw_image_fit(srv, width, height, label.c_str(), has_player ? 150.0f : 52.0f);
+    if (has_player) draw_player_bar(false);
 
     if (enc_.source_w > 0) {
         ImGui::TextDisabled("源 %dx%d · 渲染 %.1f fps", enc_.source_w, enc_.source_h,
@@ -1743,7 +1747,6 @@ void GuiApp::Impl::draw_decode_source() {
     ImGui::Checkbox("独立预览窗口", &dec_.fullscreen);
     ImGui::TextWrapped("文件模式默认直接解码。\n播放器录屏请勾选“启用定位”。");
     ImGui::EndDisabled();
-    draw_player_bar(true);
 }
 
 void GuiApp::Impl::draw_decode_preview() {
@@ -1776,7 +1779,10 @@ void GuiApp::Impl::draw_decode_preview() {
     } else {
         label = "等待输入源";
     }
-    draw_image_fit(srv, width, height, label.c_str(), 78.0f);
+    const bool has_player =
+        dec_.source == DecodeState::Source::File && dec_.file.is_open();
+    draw_image_fit(srv, width, height, label.c_str(), has_player ? 150.0f : 78.0f);
+    if (has_player) draw_player_bar(true);
 
     if (dec_.locked) {
         ImGui::TextColored(kGreen, "● 已锁定");
@@ -1996,6 +2002,52 @@ void GuiApp::Impl::set_detached_preview(bool detached) {
     preview_window_->show();
     settings_.detached_preview = true;
     save_settings();
+}
+
+void GuiApp::Impl::update_preview_player() {
+    if (!detached_preview_ || !preview_window_) return;
+
+    FileSource* file = nullptr;
+    bool decode_mode = false;
+    if (mode_ == Mode::Encode && enc_.source == EncodeState::Source::File &&
+        enc_.file.is_open()) {
+        file = &enc_.file;
+    } else if (mode_ == Mode::Decode && dec_.source == DecodeState::Source::File &&
+               dec_.file.is_open()) {
+        file = &dec_.file;
+        decode_mode = true;
+    }
+
+    if (!file) {
+        preview_window_->set_player_state(false, false, false, true, 0, 0, 0);
+        return;
+    }
+
+    preview_window_->set_player_state(true, true, file->paused(), file->loop(),
+                                      file->position_ms(), file->duration_ms(),
+                                      file->fps());
+    PreviewPlayerCommand command;
+    while (preview_window_->take_player_command(&command)) {
+        switch (command.type) {
+            case PreviewPlayerCommand::Type::TogglePause:
+                file->set_paused(!file->paused());
+                break;
+            case PreviewPlayerCommand::Type::ToggleLoop:
+                file->set_loop(!file->loop());
+                settings_.player_loop = file->loop();
+                save_settings();
+                break;
+            case PreviewPlayerCommand::Type::Seek: {
+                cv::Mat frame;
+                if (file->seek_ms(command.value, frame)) {
+                    apply_player_seek(decode_mode, frame);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
 }
 
 void GuiApp::Impl::update_detached_preview() {
@@ -2612,8 +2664,6 @@ void GuiApp::Impl::draw_player_bar(bool decode_mode) {
 
     if (!file.is_open()) return;
 
-    ImGui::Separator();
-    ImGui::TextDisabled("播放控制");
     const bool paused = file.paused();
     if (ImGui::Button(paused ? "播放" : "暂停", ImVec2(64, 0))) {
         file.set_paused(!paused);
