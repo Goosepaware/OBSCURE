@@ -17,6 +17,7 @@ struct TransportOptions {
     int algorithm = 0;   // 0 = classic grid, 1 = Hilbert spatial curve
     bool use_audio = false;
     int audio_algorithm = 0;  // 0 = subband shift, 1 = mirror inversion
+    int audio_version = 2;    // 1 = legacy, 2 = pre-emphasis + guard band
 };
 
 struct Metadata {
@@ -45,6 +46,7 @@ struct Metadata {
     int algorithm() const { return (flags & 0x10) != 0 ? 1 : 0; }
     bool use_audio() const { return (flags & 0x20) != 0; }
     int audio_algorithm() const { return (flags & 0x40) != 0 ? 1 : 0; }
+    int audio_version() const { return (flags & 0x80) != 0 ? 2 : 1; }
 };
 
 uint16_t crc16_ccitt(const uint8_t* data, size_t size);

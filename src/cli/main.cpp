@@ -51,6 +51,7 @@ void usage() {
         << "  --no-color           disable color scrambling (keep original colors)\n"
         << "  --no-audio           keep the original audio (skip audio scrambling)\n"
         << "  --audio-mode MODE    subband (default, strong) or mirror (high fidelity)\n"
+        << "  --audio-legacy       decode/encode with the legacy v1 audio DSP\n"
         << "  --frames N           process at most N frames (0 = all)\n"
         << "  --start SEC          seek before reading\n"
         << "  --ffmpeg PATH        ffmpeg executable\n"
@@ -134,9 +135,11 @@ int run_audio_command(const std::map<std::string, std::string>& args) {
     const std::string key =
         public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
     const int algorithm = obs::audio_algorithm_from_id(get(args, "mode", "strong"));
+    const int version = args.find("legacy") != args.end() ? 1 : 2;
     const bool inverse = args.find("inverse") != args.end();
 
-    obs::AudioScrambleParams params = obs::derive_audio_params(key, algorithm);
+    obs::AudioScrambleParams params =
+        obs::derive_audio_params(key, algorithm, version);
     if (inverse) params = obs::inverse_audio_params(params);
     obs::AudioScrambler scrambler;
     std::string error;
@@ -195,7 +198,8 @@ int run_audio_command(const std::map<std::string, std::string>& args) {
         return 1;
     }
     std::cout << "[audio] mode=" << (inverse ? "inverse/" : "")
-              << obs::audio_algorithm_id(algorithm) << " frames=" << total_frames
+              << obs::audio_algorithm_id(algorithm) << " v" << version
+              << " frames=" << total_frames
               << " (" << (static_cast<double>(total_frames) / 48000.0) << " s)\n";
     return 0;
 }
@@ -442,23 +446,22 @@ int run_selftest() {
         const bool audio_meta_ok =
             audio_meta.has_value() && audio_meta->use_audio() &&
             audio_meta->audio_algorithm() ==
-                static_cast<int>(obs::AudioAlgorithm::MirrorInversion);
+                static_cast<int>(obs::AudioAlgorithm::MirrorInversion) &&
+            audio_meta->audio_version() == 2;
 
         // Audio DSP round trip. The transform is time-invariant; the decoder
         // output is only delayed by the two FIR stages, so search a small
         // delay window and compare the waveforms.
-        auto audio_roundtrip = [](int algorithm, double min_snr,
+        auto audio_roundtrip = [](int algorithm, int version, double min_snr,
                                   double max_scrambled_snr) {
             const std::string audio_key = "obscure-audio-selftest";
             obs::AudioScrambler enc;
             obs::AudioScrambler dec;
             std::string err;
-            if (!enc.configure(48000, audio_key, algorithm, &err)) return false;
-            if (!dec.configure(
-                    48000,
-                    obs::inverse_audio_params(
-                        obs::derive_audio_params(audio_key, algorithm)),
-                    &err)) {
+            const obs::AudioScrambleParams enc_params =
+                obs::derive_audio_params(audio_key, algorithm, version);
+            if (!enc.configure(48000, enc_params, &err)) return false;
+            if (!dec.configure(48000, obs::inverse_audio_params(enc_params), &err)) {
                 return false;
             }
             constexpr int kFrames = 24000;
@@ -469,12 +472,14 @@ int run_selftest() {
             uint32_t rng = 0x12345678u;
             for (int i = 0; i < kFrames; ++i) {
                 const double t = static_cast<double>(i) / 48000.0;
-                double v = 0.08 * std::sin(2.0 * kPi * 300.0 * t) +
-                           0.06 * std::sin(2.0 * kPi * 820.0 * t) +
-                           0.05 * std::sin(2.0 * kPi * 1600.0 * t) +
-                           0.04 * std::sin(2.0 * kPi * 3100.0 * t) +
-                           0.03 * std::sin(2.0 * kPi * 4700.0 * t) +
-                           0.02 * std::sin(2.0 * kPi * 6800.0 * t);
+                double v = 0.08 * std::sin(2.0 * kPi * 600.0 * t) +
+                           0.07 * std::sin(2.0 * kPi * 1500.0 * t) +
+                           0.06 * std::sin(2.0 * kPi * 2400.0 * t) +
+                           0.05 * std::sin(2.0 * kPi * 3300.0 * t) +
+                           0.04 * std::sin(2.0 * kPi * 4200.0 * t) +
+                           0.03 * std::sin(2.0 * kPi * 5100.0 * t) +
+                           0.02 * std::sin(2.0 * kPi * 6000.0 * t) +
+                           0.015 * std::sin(2.0 * kPi * 6900.0 * t);
                 rng = rng * 1664525u + 1013904223u;
                 v += (static_cast<double>(rng >> 9) / 4194304.0 - 1.0) * 0.01;
                 src[static_cast<size_t>(i) * 2] = static_cast<float>(v);
@@ -513,17 +518,17 @@ int run_selftest() {
                  d <= enc.latency_samples() + 96; ++d) {
                 scrambled_best = std::max(scrambled_best, snr(src, scrambled, d));
             }
-            std::cout << "  audio algo=" << algorithm << " snr=" << best
-                      << " scrambled=" << scrambled_best << "\n";
+            std::cout << "  audio algo=" << algorithm << " v" << version
+                      << " snr=" << best << " scrambled=" << scrambled_best << "\n";
             return best >= min_snr && scrambled_best <= max_scrambled_snr;
         };
 
-        const bool audio_strong_ok =
-            audio_roundtrip(static_cast<int>(obs::AudioAlgorithm::SubbandShift), 4.0,
-                            0.0);
-        const bool audio_mirror_ok =
-            audio_roundtrip(static_cast<int>(obs::AudioAlgorithm::MirrorInversion), 6.0,
-                            0.0);
+        const bool audio_strong_ok = audio_roundtrip(
+            static_cast<int>(obs::AudioAlgorithm::SubbandShift), 2, 1.5, 10.0);
+        const bool audio_mirror_ok = audio_roundtrip(
+            static_cast<int>(obs::AudioAlgorithm::MirrorInversion), 2, 6.0, 10.0);
+        const bool audio_legacy_ok = audio_roundtrip(
+            static_cast<int>(obs::AudioAlgorithm::SubbandShift), 1, 4.0, 10.0);
 
         std::cout << "selftest: exact=" << exact << " maxdiff=" << max_diff
                   << " markers=" << det.marker_count << " h_err=" << det.reproj_error
@@ -533,10 +538,12 @@ int run_selftest() {
                   << " public_curve=" << public_curve_ok
                   << " audio_strong=" << audio_strong_ok
                   << " audio_mirror=" << audio_mirror_ok
+                  << " audio_legacy=" << audio_legacy_ok
                   << " audio_meta=" << audio_meta_ok << "\n";
         const bool ok = exact && markers_ok && meta_ok && public_ok && dihedral_ok &&
                         color_ok && hilbert_ok && curves_ok && public_curve_ok &&
-                        audio_strong_ok && audio_mirror_ok && audio_meta_ok;
+                        audio_strong_ok && audio_mirror_ok && audio_legacy_ok &&
+                        audio_meta_ok;
         std::cout << (ok ? "SELFTEST OK" : "SELFTEST FAILED") << "\n";
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
@@ -584,6 +591,7 @@ int main(int argc, char** argv) {
     const bool audio_enabled = args.find("no-audio") == args.end();
     const int audio_algorithm =
         obs::audio_algorithm_from_id(get(args, "audio-mode", "subband"));
+    const int audio_version = args.find("audio-legacy") != args.end() ? 1 : 2;
     const int max_frames = get_int(args, "frames", 0);
     const double start_sec = get_double(args, "start", 0.0);
     const double bitrate = get_double(args, "bitrate", 8.0);
@@ -625,6 +633,7 @@ int main(int argc, char** argv) {
         options.algorithm = preset.algorithm;
         options.use_audio = audio_enabled;
         options.audio_algorithm = audio_algorithm;
+        options.audio_version = audio_version;
         const cv::Mat border = obs::build_border(layout, key, options);
 
         std::cout << "[config] " << config << " cell=" << layout.cell
@@ -791,7 +800,7 @@ int main(int argc, char** argv) {
         if (audio_active) {
             std::string audio_error;
             obs::AudioScrambleParams audio_params =
-                obs::derive_audio_params(key_text, audio_algorithm);
+                obs::derive_audio_params(key_text, audio_algorithm, audio_version);
             if (mode == "decode") {
                 audio_params = obs::inverse_audio_params(audio_params);
             }

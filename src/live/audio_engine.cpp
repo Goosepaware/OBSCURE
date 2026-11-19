@@ -137,7 +137,7 @@ bool AudioEngine::start(const AudioEngineConfig& config, std::string* error) {
     impl_->engine_ms = 0.0;
 
     AudioScrambleParams params =
-        derive_audio_params(config.key, config.algorithm);
+        derive_audio_params(config.key, config.algorithm, config.version);
     if (config.decode_mode) params = inverse_audio_params(params);
     if (config.scramble &&
         !impl_->scrambler.configure(48000, params, error)) {

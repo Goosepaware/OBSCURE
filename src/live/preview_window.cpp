@@ -19,6 +19,8 @@ constexpr int kPlayButton = 1001;
 constexpr int kLoopCheck = 1002;
 constexpr int kTrackbar = 1003;
 constexpr int kTimeLabel = 1004;
+constexpr int kMuteButton = 1005;
+constexpr int kVolumeTrackbar = 1006;
 
 int scaled(int value, UINT dpi) {
     return MulDiv(value, static_cast<int>(dpi), 96);
@@ -91,11 +93,24 @@ LRESULT CALLBACK PreviewWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 self->pending_command_.type = PreviewPlayerCommand::Type::TogglePause;
             } else if (id == kLoopCheck && code == BN_CLICKED) {
                 self->pending_command_.type = PreviewPlayerCommand::Type::ToggleLoop;
+            } else if (id == kMuteButton && code == BN_CLICKED) {
+                self->pending_command_.type = PreviewPlayerCommand::Type::ToggleMute;
             }
             return 0;
         }
         case WM_HSCROLL: {
-            if (!self || reinterpret_cast<HWND>(lp) != self->trackbar_) break;
+            if (!self) break;
+            if (reinterpret_cast<HWND>(lp) == self->volume_trackbar_) {
+                const int pos =
+                    static_cast<int>(SendMessageW(self->volume_trackbar_, TBM_GETPOS, 0, 0));
+                self->player_volume_ = std::clamp(pos / 100.0f, 0.0f, 2.0f);
+                if (pos > 0) self->player_muted_ = false;
+                self->update_player_controls();
+                self->pending_command_.type = PreviewPlayerCommand::Type::SetVolume;
+                self->pending_command_.value = self->player_volume_;
+                return 0;
+            }
+            if (reinterpret_cast<HWND>(lp) != self->trackbar_) break;
             const int code = LOWORD(wp);
             const int pos = static_cast<int>(SendMessageW(self->trackbar_, TBM_GETPOS, 0, 0));
             const double ms = self->player_duration_ms_ > 0.0
@@ -245,19 +260,37 @@ bool PreviewWindow::init(ID3D11Device* device, ID3D11DeviceContext* context,
         if (error) *error = "preview window: player controls creation failed";
         return false;
     }
+    mute_button_ = CreateWindowExW(
+        0, L"BUTTON", L"静音", WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 1, 1, hwnd_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMuteButton)), instance, nullptr);
+    volume_trackbar_ = CreateWindowExW(
+        0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_HORZ | TBS_NOTICKS, 0, 0, 1, 1, hwnd_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kVolumeTrackbar)), instance,
+        nullptr);
+    if (!mute_button_ || !volume_trackbar_) {
+        if (error) *error = "preview window: volume controls creation failed";
+        return false;
+    }
 
     HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    for (HWND control : {play_button_, loop_check_, trackbar_, time_label_}) {
+    for (HWND control :
+         {play_button_, loop_check_, trackbar_, time_label_, mute_button_,
+          volume_trackbar_}) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     }
     SendMessageW(trackbar_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     SendMessageW(trackbar_, TBM_SETPAGESIZE, 0, 50);
+    SendMessageW(volume_trackbar_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+    SendMessageW(volume_trackbar_, TBM_SETPAGESIZE, 0, 10);
+    SendMessageW(volume_trackbar_, TBM_SETPOS, TRUE, 100);
     SendMessageW(loop_check_, BM_SETCHECK, BST_CHECKED, 0);
     last_loop_ = true;
 
     player_visible_ = false;
     layout_player();
-    for (HWND control : {play_button_, loop_check_, trackbar_, time_label_}) {
+    for (HWND control :
+         {play_button_, loop_check_, trackbar_, time_label_, mute_button_,
+          volume_trackbar_}) {
         ShowWindow(control, SW_HIDE);
     }
 
@@ -365,7 +398,7 @@ void PreviewWindow::layout_player() {
     const int client_w = std::max(1L, client.right - client.left);
     const int client_h = std::max(1L, client.bottom - client.top);
     const UINT dpi = GetDpiForWindow(hwnd_);
-    const int bar_h = player_visible_ ? scaled(56, dpi) : 0;
+    const int bar_h = player_visible_ ? scaled(84, dpi) : 0;
     const int video_h = std::max(1, client_h - bar_h);
 
     SetWindowPos(video_hwnd_, nullptr, 0, 0, client_w, video_h,
@@ -379,25 +412,33 @@ void PreviewWindow::layout_player() {
     if (!player_visible_ || !play_button_) return;
 
     const int margin = scaled(8, dpi);
-    const int control_h = scaled(30, dpi);
-    const int y = video_h + scaled(13, dpi);
+    const int control_h = scaled(28, dpi);
+    const int gap = scaled(6, dpi);
+    const int row1 = video_h + scaled(6, dpi);
+    const int row2 = row1 + control_h + scaled(4, dpi);
     const int play_w = scaled(64, dpi);
     const int time_w = scaled(120, dpi);
     const int loop_w = scaled(70, dpi);
-    const int loop_x = client_w - margin - loop_w;
+    const int mute_w = scaled(64, dpi);
     const int play_x = margin;
-    const int time_x = play_x + play_w + margin;
-    const int track_x = time_x + time_w + margin;
-    const int track_w = std::max(scaled(80, dpi), loop_x - margin - track_x);
+    const int time_x = play_x + play_w + gap;
+    const int loop_x = time_x + time_w + gap;
+    const int mute_x = loop_x + loop_w + gap;
+    const int volume_x = mute_x + mute_w + gap;
+    const int volume_w = std::max(scaled(70, dpi), client_w - margin - volume_x);
 
-    SetWindowPos(play_button_, nullptr, play_x, y, play_w, control_h,
+    SetWindowPos(play_button_, nullptr, play_x, row1, play_w, control_h,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetWindowPos(time_label_, nullptr, time_x, y, time_w, control_h,
+    SetWindowPos(time_label_, nullptr, time_x, row1, time_w, control_h,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetWindowPos(trackbar_, nullptr, track_x, y, track_w, control_h,
+    SetWindowPos(loop_check_, nullptr, loop_x, row1, loop_w, control_h,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetWindowPos(loop_check_, nullptr, loop_x, y, loop_w, control_h,
+    SetWindowPos(mute_button_, nullptr, mute_x, row1, mute_w, control_h,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(volume_trackbar_, nullptr, volume_x, row1, volume_w, control_h,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(trackbar_, nullptr, margin, row2, client_w - 2 * margin,
+                 control_h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void PreviewWindow::update_player_controls() {
@@ -405,6 +446,8 @@ void PreviewWindow::update_player_controls() {
     EnableWindow(play_button_, player_running_);
     EnableWindow(loop_check_, player_running_);
     EnableWindow(trackbar_, player_running_ && player_duration_ms_ > 0.0);
+    EnableWindow(mute_button_, player_running_);
+    EnableWindow(volume_trackbar_, player_running_);
 
     if (player_paused_ != last_paused_) {
         SetWindowTextW(play_button_, player_paused_ ? L"播放" : L"暂停");
@@ -414,6 +457,17 @@ void PreviewWindow::update_player_controls() {
         SendMessageW(loop_check_, BM_SETCHECK,
                      player_loop_ ? BST_CHECKED : BST_UNCHECKED, 0);
         last_loop_ = player_loop_;
+    }
+    if (player_muted_ != last_muted_) {
+        SendMessageW(mute_button_, BM_SETCHECK,
+                     player_muted_ ? BST_CHECKED : BST_UNCHECKED, 0);
+        last_muted_ = player_muted_;
+    }
+    if (std::abs(player_volume_ - last_volume_) > 0.005f) {
+        const int pos = std::clamp(
+            static_cast<int>(std::lround(player_volume_ * 100.0f)), 0, 200);
+        SendMessageW(volume_trackbar_, TBM_SETPOS, TRUE, pos);
+        last_volume_ = player_volume_;
     }
 
     const double shown_position =
@@ -434,7 +488,8 @@ void PreviewWindow::update_player_controls() {
 
 void PreviewWindow::set_player_state(bool visible, bool running, bool paused,
                                      bool loop, double position_ms,
-                                     double duration_ms, double fps) {
+                                     double duration_ms, double fps, float volume,
+                                     bool muted) {
     const bool visibility_changed = visible != player_visible_;
     player_visible_ = visible;
     player_running_ = running;
@@ -443,6 +498,8 @@ void PreviewWindow::set_player_state(bool visible, bool running, bool paused,
     player_position_ms_ = position_ms;
     player_duration_ms_ = duration_ms;
     player_fps_ = fps;
+    player_volume_ = std::clamp(volume, 0.0f, 2.0f);
+    player_muted_ = muted;
     if (visibility_changed) layout_player();
     if (player_visible_) update_player_controls();
 }
@@ -558,6 +615,8 @@ void PreviewWindow::shutdown() {
     loop_check_ = nullptr;
     trackbar_ = nullptr;
     time_label_ = nullptr;
+    mute_button_ = nullptr;
+    volume_trackbar_ = nullptr;
     video_hwnd_ = nullptr;
     if (hwnd_) {
         DestroyWindow(hwnd_);

@@ -10,7 +10,7 @@
 namespace obs {
 
 struct PreviewPlayerCommand {
-    enum class Type { None, TogglePause, ToggleLoop, Seek };
+    enum class Type { None, TogglePause, ToggleLoop, Seek, ToggleMute, SetVolume };
     Type type = Type::None;
     double value = 0.0;
 };
@@ -47,7 +47,8 @@ public:
     // Player bar. visible=false hides the bar and gives the full client area to
     // the video. Commands are applied by the main loop via take_player_command.
     void set_player_state(bool visible, bool running, bool paused, bool loop,
-                          double position_ms, double duration_ms, double fps);
+                          double position_ms, double duration_ms, double fps,
+                          float volume, bool muted);
     bool take_player_command(PreviewPlayerCommand* command);
 
 private:
@@ -71,6 +72,8 @@ private:
     HWND loop_check_ = nullptr;
     HWND trackbar_ = nullptr;
     HWND time_label_ = nullptr;
+    HWND mute_button_ = nullptr;
+    HWND volume_trackbar_ = nullptr;
     HBRUSH dark_brush_ = nullptr;
     bool topmost_ = false;
     std::wstring title_;
@@ -82,14 +85,19 @@ private:
     double player_position_ms_ = 0.0;
     double player_duration_ms_ = 0.0;
     double player_fps_ = 0.0;
+    float player_volume_ = 1.0f;
+    bool player_muted_ = false;
     double drag_position_ms_ = 0.0;
     bool trackbar_dragging_ = false;
+    bool volume_dragging_ = false;
     ULONGLONG last_seek_tick_ = 0;
     int video_w_ = 0;
     int video_h_ = 0;
     std::wstring last_time_text_;
     bool last_paused_ = false;
     bool last_loop_ = true;
+    bool last_muted_ = false;
+    float last_volume_ = -1.0f;
     bool last_visible_ = false;
     PreviewPlayerCommand pending_command_;
 };

@@ -94,6 +94,7 @@ std::vector<int> build_metadata_bits(
     if (options.algorithm == 1) flags |= 0x10;
     if (options.use_audio) flags |= 0x20;
     if (options.audio_algorithm == 1) flags |= 0x40;
+    if (options.audio_version >= 2) flags |= 0x80;
 
     BitWriter bw;
     bw.write(0xB5C3, 16);

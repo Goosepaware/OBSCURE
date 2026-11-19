@@ -37,6 +37,7 @@ struct GuiSettings {
 
     std::wstring audio_device_id;
     float audio_volume = 1.0f;
+    bool audio_muted = false;
     bool enc_audio = true;
     int enc_audio_algorithm = 0;
     bool dec_audio = true;

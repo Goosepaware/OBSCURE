@@ -102,6 +102,7 @@ bool load_gui_settings(GuiSettings* settings) {
     settings->export_source_decode = parse_wide(values, "export_source_decode");
     settings->player_loop = parse_bool(values, "player_loop", settings->player_loop);
     settings->audio_device_id = parse_wide(values, "audio_device_id");
+    settings->audio_muted = parse_bool(values, "audio_muted", settings->audio_muted);
     const auto vol = values.find("audio_volume");
     if (vol != values.end()) {
         try {
@@ -151,6 +152,7 @@ bool save_gui_settings(const GuiSettings& settings) {
     out << "player_loop=" << (settings.player_loop ? 1 : 0) << "\n";
     out << "audio_device_id=" << wide_to_utf8(settings.audio_device_id) << "\n";
     out << "audio_volume=" << settings.audio_volume << "\n";
+    out << "audio_muted=" << (settings.audio_muted ? 1 : 0) << "\n";
     out << "enc_audio=" << (settings.enc_audio ? 1 : 0) << "\n";
     out << "enc_audio_algorithm=" << settings.enc_audio_algorithm << "\n";
     out << "dec_audio=" << (settings.dec_audio ? 1 : 0) << "\n";
