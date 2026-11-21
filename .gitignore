@@ -31,6 +31,14 @@
 /third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/SpoutDX12/
 /third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Tutorial*/
 /third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Windows/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Basic/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Binaries/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX9/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX12/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Tutorial04/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Tutorial04_Lib/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Tutorial07/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/Windows/
 
 # Logs and archives
 *.log
