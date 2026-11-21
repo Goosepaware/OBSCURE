@@ -24,6 +24,13 @@
 /third_party/Spout2/**/Tutorial*/lib/
 /third_party/UnityCapture/Install/
 /third_party/Spout2/SPOUTSDK/Examples/
+/third_party/Spout2/SPOUTSDK/SpoutLibrary/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Basic/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Binaries/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/SpoutDX9/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/SpoutDX12/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Tutorial*/
+/third_party/Spout2/SPOUTSDK/SpoutDirectX/SpoutDX/Windows/
 
 # Logs and archives
 *.log
