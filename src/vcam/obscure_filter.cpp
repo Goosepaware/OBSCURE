@@ -29,9 +29,12 @@
 
 #include "shared.inl"
 #include "streams.h"
+#include "standby_logo.h"
 #include <cguid.h>
+#include <gdiplus.h>
 #include <strsafe.h>
 #include <math.h>
+#include <vector>
 
 #define CaptureSourceName L"OBScure Virtual Camera"
 
@@ -226,10 +229,7 @@ private:
 		switch (m_pReceiver->Receive((SharedImageMemory::ReceiveCallbackFunc)ProcessImage, &State))
 		{
 			case SharedImageMemory::RECEIVERES_CAPTUREINACTIVE:{
-				//Show color pattern indicating that Unity is not sending frame data yet
-				char DisplayString[128], *DisplayStrings[] = { DisplayString };
-				int DisplayStringLens[] = { sprintf_s(DisplayString, sizeof(DisplayString), "OBScure has not started sending image data (Capture Device #%d)", 1+m_pReceiver->GetCapNum()) };
-				FillErrorPattern(ErrorDrawModes[EDC_UnityNeverStarted], &State, 1, DisplayStrings, DisplayStringLens, m_llFrame);
+				RenderStandbyCard(&State, false);
 				Sleep((DWORD)(m_avgTimePerFrame / 10000 - 1)); //just wait a bit until capturing next frame
 				break;}
 
@@ -239,10 +239,7 @@ private:
 
 			case SharedImageMemory::RECEIVERES_OLDFRAME:{
 				if (++m_llFrameMissCount < m_llFrameMissMax) break;
-				//Show color pattern when received more than X frames without new image (probably Unity stopped sending data)
-				char DisplayString[] = "OBScure has stopped sending image data", *DisplayStrings[] = { DisplayString };
-				int DisplayStringLens[] = { sizeof(DisplayString) - 1 };
-				FillErrorPattern(ErrorDrawModes[EDC_UnitySendingStopped], &State, 1, DisplayStrings, DisplayStringLens, m_llFrame);
+				RenderStandbyCard(&State, true);
 				break;}
 		}
 		if (OutputFrameRate) RenderFPSDisplay(&State);
@@ -694,6 +691,180 @@ private:
 			Job.Width = State->BufWidth, Job.RowStart = 0, Job.RowEnd = State->BufHeight;
 			State->Owner->m_ProcessWorkers.StartNewJob(Job);
 		}
+	}
+
+	std::vector<uint8_t> m_StandbyCache;
+	int m_StandbyW = 0;
+	int m_StandbyH = 0;
+	int m_StandbyBPP = 0;
+	bool m_StandbyStopped = false;
+
+	void RenderStandbyCard(ProcessState* State, bool stopped)
+	{
+		if (!State || !State->Buf || State->BufWidth <= 0 || State->BufHeight <= 0) return;
+		const int w = State->BufWidth;
+		const int h = State->BufHeight;
+		const int bpp = State->BufBPP;
+		const size_t need = static_cast<size_t>(w) * h * bpp;
+		if (m_StandbyW == w && m_StandbyH == h && m_StandbyBPP == bpp &&
+		    m_StandbyStopped == stopped && m_StandbyCache.size() == need)
+		{
+			memcpy(State->Buf, m_StandbyCache.data(), need);
+			return;
+		}
+
+		struct GdiplusGuard {
+			ULONG_PTR token = 0;
+			bool ok = false;
+			GdiplusGuard() {
+				Gdiplus::GdiplusStartupInput input;
+				ok = (Gdiplus::GdiplusStartup(&token, &input, nullptr) == Gdiplus::Ok);
+			}
+			~GdiplusGuard() {
+				if (ok) Gdiplus::GdiplusShutdown(token);
+			}
+		} gdip;
+
+		m_StandbyCache.assign(need, 0);
+		if (!gdip.ok)
+		{
+			memcpy(State->Buf, m_StandbyCache.data(), need);
+			return;
+		}
+
+		Gdiplus::Bitmap canvas(w, h, PixelFormat32bppARGB);
+		Gdiplus::Graphics g(&canvas);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+		g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+		g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+		// Deep dark-slate gradient background
+		Gdiplus::LinearGradientBrush bgBrush(
+			Gdiplus::Point(0, 0), Gdiplus::Point(w, h),
+			Gdiplus::Color(255, 11, 15, 22),
+			Gdiplus::Color(255, 20, 29, 42));
+		g.FillRectangle(&bgBrush, 0, 0, w, h);
+
+		// Subtle architectural grid
+		const int gridStep = max(24, min(w, h) / 14);
+		Gdiplus::Pen gridPen(Gdiplus::Color(18, 120, 170, 220), 1.0f);
+		for (int x = 0; x < w; x += gridStep) g.DrawLine(&gridPen, x, 0, x, h);
+		for (int y = 0; y < h; y += gridStep) g.DrawLine(&gridPen, 0, y, w, y);
+
+		// Soft cyan radial glow behind the center card
+		const float s = min(w / 1920.0f, h / 1080.0f);
+		const float cx = w * 0.5f;
+		const float cy = h * 0.48f;
+		{
+			Gdiplus::GraphicsPath glowPath;
+			const float rx = 420.0f * s;
+			const float ry = 260.0f * s;
+			glowPath.AddEllipse(cx - rx, cy - ry, rx * 2.0f, ry * 2.0f);
+			Gdiplus::PathGradientBrush glowBrush(&glowPath);
+			glowBrush.SetCenterColor(Gdiplus::Color(46, 34, 211, 238));
+			Gdiplus::Color surround(0, 11, 15, 22);
+			int count = 1;
+			glowBrush.SetSurroundColors(&surround, &count);
+			g.FillPath(&glowBrush, &glowPath);
+		}
+
+		// Center glassmorphic card
+		const float cardW = min(w * 0.82f, 920.0f * s);
+		const float cardH = min(h * 0.72f, 440.0f * s);
+		const float cardX = cx - cardW * 0.5f;
+		const float cardY = cy - cardH * 0.5f;
+		const float rad = 24.0f * s;
+		{
+			Gdiplus::GraphicsPath cardPath;
+			cardPath.AddArc(cardX, cardY, rad * 2, rad * 2, 180, 90);
+			cardPath.AddArc(cardX + cardW - rad * 2, cardY, rad * 2, rad * 2, 270, 90);
+			cardPath.AddArc(cardX + cardW - rad * 2, cardY + cardH - rad * 2, rad * 2, rad * 2, 0, 90);
+			cardPath.AddArc(cardX, cardY + cardH - rad * 2, rad * 2, rad * 2, 90, 90);
+			cardPath.CloseFigure();
+
+			Gdiplus::SolidBrush cardFill(Gdiplus::Color(195, 19, 25, 34));
+			g.FillPath(&cardFill, &cardPath);
+			Gdiplus::Pen cardBorder(Gdiplus::Color(90, 56, 189, 248), max(1.0f, 1.5f * s));
+			g.DrawPath(&cardBorder, &cardPath);
+		}
+
+		// Logo on the left of the card
+		const float logoSize = 200.0f * s;
+		const float logoX = cardX + 64.0f * s;
+		const float logoY = cy - logoSize * 0.5f;
+		{
+			Gdiplus::Bitmap logoBmp(kStandbyLogoW, kStandbyLogoH, kStandbyLogoW * 4,
+				PixelFormat32bppARGB, const_cast<BYTE*>(kStandbyLogoBGRA));
+			g.DrawImage(&logoBmp, logoX, logoY, logoSize, logoSize);
+		}
+
+		// Typography on the right of the logo
+		const float textX = logoX + logoSize + 48.0f * s;
+		const float textW = (cardX + cardW) - textX - 40.0f * s;
+		Gdiplus::FontFamily fontFam(L"Microsoft YaHei");
+		Gdiplus::Font titleFont(&fontFam, max(12.0f, 44.0f * s), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+		Gdiplus::Font subFont(&fontFam, max(10.0f, 28.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+		Gdiplus::Font pillFont(&fontFam, max(9.0f, 18.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+
+		Gdiplus::SolidBrush whiteBrush(Gdiplus::Color(255, 240, 246, 252));
+		Gdiplus::SolidBrush accentBrush(Gdiplus::Color(255, 56, 189, 248));
+		Gdiplus::SolidBrush mutedBrush(Gdiplus::Color(255, 148, 163, 184));
+
+		Gdiplus::StringFormat sf;
+		sf.SetAlignment(Gdiplus::StringAlignmentNear);
+		sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
+
+		g.DrawString(L"OBScure", -1, &titleFont,
+			Gdiplus::RectF(textX, cy - 86.0f * s, textW, 58.0f * s), &sf, &whiteBrush);
+		g.DrawString(L"实时音视频混淆解决方案", -1, &subFont,
+			Gdiplus::RectF(textX, cy - 22.0f * s, textW, 44.0f * s), &sf, &accentBrush);
+
+		// Status pill
+		const wchar_t* statusText = stopped ? L"已停止输出 · 等待重新连接" : L"待机中 · 等待 OBScure 编码输出";
+		const float pillY = cy + 40.0f * s;
+		const float pillH = 34.0f * s;
+		const float pillW = min(textW, 310.0f * s);
+		Gdiplus::SolidBrush pillBg(Gdiplus::Color(40, 56, 189, 248));
+		Gdiplus::Pen pillBorder(Gdiplus::Color(100, 56, 189, 248), max(1.0f, 1.0f * s));
+		g.FillRectangle(&pillBg, textX, pillY, pillW, pillH);
+		g.DrawRectangle(&pillBorder, textX, pillY, pillW, pillH);
+		Gdiplus::StringFormat pillSf;
+		pillSf.SetAlignment(Gdiplus::StringAlignmentCenter);
+		pillSf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+		g.DrawString(statusText, -1, &pillFont,
+			Gdiplus::RectF(textX, pillY, pillW, pillH), &pillSf, &mutedBrush);
+
+		// Copy canvas to BGR24 or BGRA32 cache
+		Gdiplus::BitmapData bd{};
+		Gdiplus::Rect lockRect(0, 0, w, h);
+		if (canvas.LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok)
+		{
+			const uint8_t* srcBase = static_cast<const uint8_t*>(bd.Scan0);
+			for (int y = 0; y < h; ++y)
+			{
+				const uint8_t* srcRow = srcBase + static_cast<size_t>(y) * bd.Stride;
+				uint8_t* dstRow = m_StandbyCache.data() + static_cast<size_t>(y) * w * bpp;
+				if (bpp == 4)
+				{
+					memcpy(dstRow, srcRow, static_cast<size_t>(w) * 4);
+				}
+				else
+				{
+					for (int x = 0; x < w; ++x)
+					{
+						dstRow[x * 3 + 0] = srcRow[x * 4 + 0];
+						dstRow[x * 3 + 1] = srcRow[x * 4 + 1];
+						dstRow[x * 3 + 2] = srcRow[x * 4 + 2];
+					}
+				}
+			}
+			canvas.UnlockBits(&bd);
+		}
+		m_StandbyW = w;
+		m_StandbyH = h;
+		m_StandbyBPP = bpp;
+		m_StandbyStopped = stopped;
+		memcpy(State->Buf, m_StandbyCache.data(), need);
 	}
 
 	static void FillErrorPattern(EErrorDrawMode edm, ProcessState* State, int LineCount = 0, char** LineStrings = NULL, int* LineLengths = NULL, LONGLONG FrameNumber = -1)

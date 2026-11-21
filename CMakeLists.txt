@@ -166,7 +166,7 @@ target_include_directories(obscure-vcam PRIVATE
     "${CMAKE_SOURCE_DIR}/third_party/UnityCapture/Source"
 )
 target_link_libraries(obscure-vcam PRIVATE
-    strmiids ole32 oleaut32 uuid user32 gdi32 advapi32 winmm version shlwapi
+    strmiids ole32 oleaut32 uuid user32 gdi32 gdiplus advapi32 winmm version shlwapi
 )
 target_link_options(obscure-vcam PRIVATE
     "/DEF:${CMAKE_SOURCE_DIR}/third_party/UnityCapture/Source/UnityCaptureFilter.def"
