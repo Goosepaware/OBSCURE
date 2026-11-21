@@ -18,6 +18,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <winrt/base.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -45,6 +46,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "gui/gui_settings.h"
 #include "io/ffmpeg_audio.h"
 #include "io/ffmpeg_sink.h"
+#include "io/hw_encoder.h"
 #include "live/audio_engine.h"
 #include "live/d3d_helpers.h"
 #include "live/decode_pipeline.h"
@@ -85,8 +87,14 @@ const wchar_t kVideoFilter[] =
 
 const std::wstring& ffmpeg_tool_path() {
     static const std::wstring path = [] {
-        if (fs::exists("D:/program/OBScure/ffmpeg.exe")) {
-            return std::wstring(L"D:/program/OBScure/ffmpeg.exe");
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path candidates[] = {
+            fs::path(exe_dir()) / L"ffmpeg.exe",
+            fs::path(exe_dir()).parent_path() / L"ffmpeg.exe",
+        };
+        for (const auto& candidate : candidates) {
+            if (fs::exists(candidate, ec)) return candidate.wstring();
         }
         return std::wstring(L"ffmpeg");
     }();
@@ -343,6 +351,7 @@ struct GuiApp::Impl {
         std::wstring output_path;
         std::string format = "mp4";
         std::string codec = "h264";
+        std::string encoder_name = "libx264";
         int bitrate = 8;
         int total_frames = 0;
         int done_frames = 0;
@@ -395,6 +404,10 @@ struct GuiApp::Impl {
     char key_buf_[128] = "obscure-demo-key";
     int preset_index_ = 1;
 int record_bitrate_ = 8;
+    HwAccel hw_accel_ = HwAccel::Auto;
+    HwEncoderStatus hw_status_;
+    std::thread hw_probe_thread_;
+    std::atomic<bool> hw_probe_ready_{false};
 int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     bool public_mode_ = false;
     bool enc_use_color_ = true;
@@ -489,6 +502,8 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void draw_encode_source();
     void draw_encode_outputs();
     void draw_presets();
+    void draw_hw_accel_combo(const char* id);
+    void start_hw_probe(bool force = false);
     void draw_audio_settings(bool for_decode);
     void draw_volume_controls(const char* suffix);
     void draw_volume_row();
@@ -522,11 +537,13 @@ int margin_override_ = -1;  // -1 auto, 0/1/2 manual
     void finish_export(bool cancelled);
     void draw_export_ui(bool for_decode);
     void probe_file(bool decode_mode, const std::wstring& path);
+    void handle_dropped_file(const std::wstring& path);
     std::wstring default_export_path(bool for_decode, const std::wstring& source);
     double export_source_duration_ms(bool for_decode) const;
     void draw_encode_actions();
     void draw_decode_actions();
     void draw_status_bar();
+    void draw_status_badges();
     void draw_picker();
     void draw_image_fit(ID3D11ShaderResourceView* srv, int width, int height,
                         const char* label, float footer = 28.0f);
@@ -652,6 +669,7 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     enc_audio_algorithm_ = std::clamp(settings_.enc_audio_algorithm, 0, 1);
     dec_audio_enabled_ = settings_.dec_audio;
     dec_audio_algorithm_ = std::clamp(settings_.dec_audio_algorithm, 0, 1);
+    hw_accel_ = hw_accel_from_id(settings_.hw_accel);
     audio_device_index_ = 0;
     if (settings_.audio_device_id == L"none") {
         audio_device_index_ = 1;
@@ -669,6 +687,7 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     detached_preview_ = start_detached_;
     g_console_min_size = detached_preview_;
     export_bitrate_ = std::clamp(settings_.export_bitrate, 1, 100);
+    record_bitrate_ = std::clamp(settings_.record_bitrate, 2, 50);
     export_path_encode_ = settings_.export_path_encode;
     export_path_decode_ = settings_.export_path_decode;
     for (int i = 0; i < kExportFormatCount; ++i) {
@@ -685,6 +704,7 @@ bool GuiApp::Impl::init(HINSTANCE instance) {
     if (!init_d3d()) return false;
     if (!init_imgui()) return false;
     if (start_detached_) restore_detached_preview();
+    start_hw_probe();
     log_line("GUI started");
     apply_auto_start();
     return true;
@@ -762,6 +782,8 @@ void GuiApp::Impl::parse_command_line() {
             } catch (...) {
                 auto_export_bitrate_ = 0;
             }
+        } else if (arg == L"--encoder" && i + 1 < argc) {
+            hw_accel_ = hw_accel_from_id(wide_to_utf8(argv[++i]));
         } else if (arg == L"--auto") {
             auto_start_ = true;
         } else if (arg == L"--spout") {
@@ -890,7 +912,7 @@ void GuiApp::Impl::save_settings() {
     store_main_rect(detached_preview_);
     if (preview_window_) {
         RECT rect{};
-        preview_window_->get_window_rect(&rect);
+        preview_window_->get_restore_rect(&rect);
         if (rect.right > rect.left && rect.bottom > rect.top) {
             settings_.preview_x = rect.left;
             settings_.preview_y = rect.top;
@@ -913,6 +935,7 @@ void GuiApp::Impl::save_settings() {
 void GuiApp::Impl::shutdown() {
     finish_export(true);
     save_settings();
+    if (hw_probe_thread_.joinable()) hw_probe_thread_.join();
     stop_encode();
     stop_decode();
     stop_picker_preview();
@@ -990,6 +1013,21 @@ LRESULT CALLBACK GuiApp::Impl::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case WM_CLOSE:
             if (self) self->running_ = false;
             return 0;
+        case WM_DROPFILES: {
+            if (self) {
+                HDROP drop = reinterpret_cast<HDROP>(wp);
+                const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                for (UINT i = 0; i < count; ++i) {
+                    const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+                    std::wstring path(len, L'\0');
+                    if (DragQueryFileW(drop, i, path.data(), len + 1) > 0) {
+                        self->handle_dropped_file(path);
+                    }
+                }
+                DragFinish(drop);
+            }
+            return 0;
+        }
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -1085,6 +1123,7 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
     if (!detached_preview_ && settings_.maximized) ShowWindow(hwnd_, SW_MAXIMIZE);
+    DragAcceptFiles(hwnd_, TRUE);
     return true;
 }
 
@@ -1393,7 +1432,9 @@ void GuiApp::Impl::draw_header() {
 
 void GuiApp::Impl::draw_encode() {
     const float action_h = detached_preview_ ? 112.0f : 62.0f;
-    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - action_h);
+    // Keep room for the status bar so the badges and log button stay visible.
+    const float content_h =
+        std::max(200.0f, ImGui::GetContentRegionAvail().y - action_h - 26.0f);
     const float left_w = detached_preview_
                              ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
                              : 370.0f;
@@ -1502,6 +1543,9 @@ void GuiApp::Impl::draw_encode_outputs() {
     ImGui::BeginDisabled(enc_.running);
     ImGui::Checkbox("输出窗口（OBS 窗口采集）", &enc_.out_window);
     ImGui::Checkbox("Spout（需 OBS 插件）", &enc_.out_spout);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("需要 OBS 的 Spout2 插件 1.10.0；\nOBS 添加 Spout2 Capture 并选择同名发送端。");
+    }
     if (enc_.out_spout) {
         char name[128]{};
         strncpy_s(name, enc_.spout_name.c_str(), _TRUNCATE);
@@ -1510,6 +1554,9 @@ void GuiApp::Impl::draw_encode_outputs() {
         }
     }
     ImGui::Checkbox("虚拟摄像头（OBScure）", &enc_.out_vcam);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("在 OBS 中添加“视频采集设备”，\n选择 OBScure Virtual Camera（NV12 / 1080p60）。");
+    }
     ImGui::TextWrapped("DirectShow 虚拟摄像头");
     ImGui::TextWrapped("优先 NV12，其次 YUY2 / RGB。");
     ImGui::TextWrapped("OBS 添加“视频采集设备”即可。");
@@ -1525,7 +1572,9 @@ void GuiApp::Impl::draw_encode_outputs() {
         ImGui::SetNextItemWidth(100);
         if (ImGui::InputInt("录制码率 (Mbps)", &record_bitrate_)) {
             record_bitrate_ = std::clamp(record_bitrate_, 2, 50);
+            settings_.record_bitrate = record_bitrate_;
         }
+        draw_hw_accel_combo("record_hw");
         ImGui::TextWrapped("直播参考：1080p60 约 6–8 Mbps，720p60 约 4–6 Mbps。");
     }
     ImGui::EndDisabled();
@@ -1550,6 +1599,61 @@ void GuiApp::Impl::draw_encode_outputs() {
     }
 }
 
+void GuiApp::Impl::start_hw_probe(bool force) {
+    if (hw_probe_thread_.joinable()) hw_probe_thread_.join();
+    hw_probe_ready_.store(false, std::memory_order_release);
+    hw_probe_thread_ = std::thread([this, force] {
+        HwEncoderStatus status = probe_hw_encoders(ffmpeg_tool_path(), force);
+        hw_status_ = status;
+        hw_probe_ready_.store(true, std::memory_order_release);
+    });
+}
+
+void GuiApp::Impl::draw_hw_accel_combo(const char* id) {
+    ImGui::PushID(id);
+    const char* items[] = {
+        hw_accel_label(HwAccel::Auto), hw_accel_label(HwAccel::Nvidia),
+        hw_accel_label(HwAccel::Intel), hw_accel_label(HwAccel::Amd),
+        hw_accel_label(HwAccel::Cpu),
+    };
+    int index = static_cast<int>(hw_accel_);
+    ImGui::TextDisabled("编码器");
+    ImGui::SetNextItemWidth(170);
+    if (ImGui::Combo("##hw_accel", &index, items, 5)) {
+        hw_accel_ = static_cast<HwAccel>(index);
+        settings_.hw_accel = hw_accel_id(hw_accel_);
+        save_settings();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("重新探测")) start_hw_probe(true);
+    if (!hw_probe_ready_.load(std::memory_order_acquire)) {
+        ImGui::TextDisabled("正在探测硬件编码器…");
+        ImGui::PopID();
+        return;
+    }
+    if (hw_status_.nvenc || hw_status_.qsv || hw_status_.amf) {
+        char text[160]{};
+        sprintf_s(text, "可用：%s%s%s", hw_status_.nvenc ? "NVENC " : "",
+                  hw_status_.qsv ? "QSV " : "", hw_status_.amf ? "AMF" : "");
+        ImGui::TextColored(kGreen, "%s", text);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("探测详情：%s", hw_status_.detail.c_str());
+        }
+    } else {
+        ImGui::TextColored(kYellow, "未检测到可用硬件编码器，将使用 CPU 软编。");
+    }
+    if (hw_accel_ != HwAccel::Auto && hw_accel_ != HwAccel::Cpu) {
+        const bool ok = (hw_accel_ == HwAccel::Nvidia && hw_status_.nvenc) ||
+                        (hw_accel_ == HwAccel::Intel && hw_status_.qsv) ||
+                        (hw_accel_ == HwAccel::Amd && hw_status_.amf);
+        if (!ok) {
+            ImGui::TextColored(kYellow,
+                               "所选硬件不可用，启动时会自动回退到 CPU 软编。");
+        }
+    }
+    ImGui::PopID();
+}
+
 void GuiApp::Impl::draw_presets() {
     ImGui::TextDisabled("混淆算法");
     ImGui::BeginDisabled(enc_.running);
@@ -1561,6 +1665,11 @@ void GuiApp::Impl::draw_presets() {
             enc_use_color_ = false;
             dec_.use_color = false;
         }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "经典网格：分块置换 + 保护边 + 颜色/翻转，抗还原最强。\n"
+            "空间曲线：密钥生成二维希尔伯特曲线，块边缘连续，画质更高。");
     }
     ImGui::EndDisabled();
 
@@ -1585,6 +1694,11 @@ void GuiApp::Impl::draw_presets() {
         }
         ImGui::EndCombo();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "cell 越小越难还原，但码率需求更高。\n"
+            "空间曲线建议 16px；经典网格建议 32px / 1.2x。");
+    }
     ImGui::EndDisabled();
     const auto& p = kPresets[preset_index_];
     ImGui::TextDisabled("cell %d · guard %d · scale %.1fx", p.cell, p.guard, p.scale);
@@ -1607,6 +1721,12 @@ void GuiApp::Impl::draw_audio_settings(bool for_decode) {
     if (enabled) {
         const char* algorithms[] = {"强混淆（移频+倒置）", "高保真（全带镜像）"};
         ImGui::Combo("##audio_algo", &algorithm, algorithms, 2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "强混淆：8 段 900 Hz 搬移 + 倒置，原声特征隐藏最好，\n"
+                "AAC 128k 还原约 14 dB。\n"
+                "高保真：4 段对称镜像，压缩后还原约 17 dB，混淆稍弱。");
+        }
         std::string preview = "系统默认";
         if (audio_device_index_ == 1) {
             preview = "不输出（仅录制）";
@@ -1870,7 +1990,8 @@ void GuiApp::Impl::draw_encode_actions() {
 
 void GuiApp::Impl::draw_decode() {
     const float action_h = detached_preview_ ? 116.0f : 62.0f;
-    const float content_h = std::max(240.0f, ImGui::GetContentRegionAvail().y - action_h);
+    const float content_h =
+        std::max(200.0f, ImGui::GetContentRegionAvail().y - action_h - 26.0f);
     const float left_w = detached_preview_
                              ? std::min(560.0f, ImGui::GetContentRegionAvail().x)
                              : 370.0f;
@@ -2352,6 +2473,34 @@ void GuiApp::Impl::update_detached_preview() {
     preview_window_->present(srv, width, height);
 }
 
+void GuiApp::Impl::handle_dropped_file(const std::wstring& path) {
+    if (path.empty()) return;
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) {
+        set_error("拖入的项目不是文件。");
+        return;
+    }
+    const bool for_decode = mode_ == Mode::Decode;
+    if (for_decode ? dec_.running : enc_.running) {
+        set_error(for_decode ? "请先停止解码，再拖入新文件。"
+                             : "请先停止编码，再拖入新文件。");
+        return;
+    }
+    if (for_decode) {
+        dec_.source = DecodeState::Source::File;
+        dec_.file_path = path;
+        probe_file(true, path);
+    } else {
+        enc_.source = EncodeState::Source::File;
+        enc_.file_path = path;
+        enc_.source_w = 0;
+        enc_.source_h = 0;
+        probe_file(false, path);
+    }
+    log_line(std::string("dropped file: ") + (for_decode ? "decode" : "encode") +
+             " " + wide_to_utf8(path));
+}
+
 void GuiApp::Impl::probe_file(bool decode_mode, const std::wstring& path) {
     if (!export_.running) {
         export_.message.clear();
@@ -2654,12 +2803,14 @@ bool GuiApp::Impl::start_export(bool for_decode) {
     const VideoCodec codec = state.codec == "h265"   ? VideoCodec::H265
                              : state.codec == "av1" ? VideoCodec::Av1
                                                     : VideoCodec::H264;
+    state.encoder_name = select_video_encoder(codec, hw_accel_, ffmpeg_tool_path());
     if (!state.sink->start(device_.Get(), context_.Get(), state.width, state.height,
                            state.fps, state.bitrate, state.output_path, &error,
-                           codec)) {
+                           codec, state.encoder_name)) {
         set_error("启动导出编码失败: " + error);
         return false;
     }
+    log_line("export ffmpeg: " + state.sink->command_line());
 
     state.started = Clock::now();
     export_ = std::move(state);
@@ -2679,6 +2830,7 @@ bool GuiApp::Impl::start_export(bool for_decode) {
     save_settings();
     log_line(std::string("export started: ") + (for_decode ? "decode" : "encode") +
              " format=" + export_.format + " codec=" + export_.codec +
+             " encoder=" + export_.encoder_name +
              " bitrate=" + std::to_string(export_.bitrate));
     return true;
 }
@@ -2820,7 +2972,8 @@ void GuiApp::Impl::finish_export(bool cancelled) {
     }
     save_settings();
     log_line(std::string("export finished: ") + export_.message +
-             " frames=" + std::to_string(export_.done_frames));
+             " frames=" + std::to_string(export_.done_frames) +
+             (export_.error.empty() ? "" : " error=" + export_.error));
 }
 
 void GuiApp::Impl::draw_export_ui(bool for_decode) {
@@ -2846,10 +2999,19 @@ void GuiApp::Impl::draw_export_ui(bool for_decode) {
             sprintf_s(text, "%d 帧", export_.done_frames);
         }
         ImGui::ProgressBar(progress, ImVec2(-1, 0), text);
-        ImGui::TextDisabled("%s导出中 · %.1f 秒", export_.for_decode ? "解码" : "编码",
-                            std::chrono::duration<double>(Clock::now() -
-                                                          export_.started)
-                                .count());
+        const double elapsed =
+            std::chrono::duration<double>(Clock::now() - export_.started).count();
+        const double speed = elapsed > 0.05 ? export_.done_frames / elapsed : 0.0;
+        if (export_.total_frames > 0 && speed > 0.5) {
+            const double left =
+                std::max(0.0, (export_.total_frames - export_.done_frames) / speed);
+            ImGui::TextDisabled("%s导出中 · 已用 %.1f 秒 · %.1f fps · 剩余约 %s",
+                                export_.for_decode ? "解码" : "编码", elapsed, speed,
+                                format_time_ms(left * 1000.0).c_str());
+        } else {
+            ImGui::TextDisabled("%s导出中 · %.1f 秒",
+                                export_.for_decode ? "解码" : "编码", elapsed);
+        }
         if (ImGui::Button("取消导出", ImVec2(110, 30))) {
             export_.cancel_requested = true;
         }
@@ -2875,10 +3037,57 @@ void GuiApp::Impl::draw_export_ui(bool for_decode) {
         settings_.export_codec = kExportFormats[format_index].codec;
         save_settings();
     }
+    ImGui::TextDisabled("码率 (Mbps)");
     ImGui::SetNextItemWidth(100);
-    if (ImGui::InputInt("码率 (Mbps)##export", &export_bitrate_)) {
+    if (ImGui::InputInt("##export", &export_bitrate_)) {
         export_bitrate_ = std::clamp(export_bitrate_, 1, 100);
         settings_.export_bitrate = export_bitrate_;
+    }
+    ImGui::SameLine();
+    for (const int preset : {6, 10, 16}) {
+        char label[16]{};
+        sprintf_s(label, "%dM", preset);
+        if (ImGui::SmallButton(label)) {
+            export_bitrate_ = preset;
+            settings_.export_bitrate = export_bitrate_;
+        }
+        if (preset != 16) ImGui::SameLine();
+    }
+    if (export_bitrate_ < 4) {
+        ImGui::TextColored(kYellow, "低于 4 Mbps 可能导致块边界损坏，建议 6–10 Mbps。");
+    }
+    draw_hw_accel_combo("export_hw");
+    if (hw_probe_ready_.load(std::memory_order_acquire)) {
+        const std::string& codec =
+            kExportFormats[std::clamp(export_format_index_, 0, kExportFormatCount - 1)]
+                .codec;
+        const VideoCodec target = codec == "h265"   ? VideoCodec::H265
+                                  : codec == "av1" ? VideoCodec::Av1
+                                                   : VideoCodec::H264;
+        const HwEncoderStatus cached = hw_status_;
+        const char* resolved = "CPU 软编";
+        if (hw_accel_ != HwAccel::Cpu) {
+            const bool nv = cached.nvenc && (target != VideoCodec::Av1 ||
+                                             cached.av1_nvenc);
+            const bool qsv = cached.qsv && (target != VideoCodec::Av1 ||
+                                            cached.av1_qsv);
+            const bool amf = cached.amf && (target != VideoCodec::Av1 ||
+                                            cached.av1_amf);
+            if (hw_accel_ == HwAccel::Nvidia) {
+                resolved = nv ? "NVIDIA NVENC" : "CPU 软编（回退）";
+            } else if (hw_accel_ == HwAccel::Intel) {
+                resolved = qsv ? "Intel Quick Sync" : "CPU 软编（回退）";
+            } else if (hw_accel_ == HwAccel::Amd) {
+                resolved = amf ? "AMD AMF" : "CPU 软编（回退）";
+            } else if (nv) {
+                resolved = "NVIDIA NVENC";
+            } else if (qsv) {
+                resolved = "Intel Quick Sync";
+            } else if (amf) {
+                resolved = "AMD AMF";
+            }
+        }
+        ImGui::TextDisabled("导出将使用：%s", resolved);
     }
 
     const double duration_ms = export_source_duration_ms(for_decode);
@@ -2928,6 +3137,19 @@ void GuiApp::Impl::draw_export_ui(bool for_decode) {
     }
     if (!export_.message.empty()) {
         ImGui::TextWrapped("%s", export_.message.c_str());
+        if (export_.error.empty() && !export_.output_path.empty() &&
+            fs::exists(export_.output_path)) {
+            if (ImGui::Button("打开所在文件夹", ImVec2(140, 0))) {
+                const std::wstring args =
+                    L"/select,\"" + export_.output_path + L"\"";
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr,
+                              SW_SHOWNORMAL);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("复制路径", ImVec2(90, 0))) {
+                ImGui::SetClipboardText(wide_to_utf8(export_.output_path).c_str());
+            }
+        }
     }
     if (!export_.error.empty()) {
         ImGui::TextWrapped("%s", export_.error.c_str());
@@ -3146,19 +3368,82 @@ void GuiApp::Impl::draw_decode_actions() {
     ImGui::EndChild();
 }
 
+void GuiApp::Impl::draw_status_badges() {
+    const Preset& preset =
+        kPresets[std::clamp(preset_index_, 0, kPresetCount - 1)];
+    const bool encoding_mode = mode_ == Mode::Encode;
+    const bool running = encoding_mode ? enc_.running : dec_.running;
+    const bool audio_on =
+        encoding_mode ? enc_audio_enabled_ : dec_audio_enabled_;
+    const int algorithm =
+        encoding_mode ? enc_audio_algorithm_ : dec_audio_algorithm_;
+    const int version = encoding_mode ? enc_audio_version_ : dec_audio_version_;
+
+    char video[96]{};
+    sprintf_s(video, "%s %s", preset.algorithm ? "空间曲线" : "经典网格",
+              preset.id);
+    ImGui::TextColored(running ? kGreen : kMuted, "[%s]", video);
+
+    char audio[96]{};
+    if (audio_on) {
+        sprintf_s(audio, "音频 %s v%d",
+                  algorithm == 1 ? "高保真镜像" : "强混淆", version);
+    } else {
+        sprintf_s(audio, "音频 原声直通");
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(audio_on && running ? kGreen : kMuted, "[%s]", audio);
+    if (running && !audio_engine_.active() && (audio_on || !encoding_mode)) {
+        ImGui::SameLine();
+        ImGui::TextColored(kYellow, "[音频未启动]");
+    }
+
+    if (audio_muted_) {
+        ImGui::SameLine();
+        ImGui::TextColored(kYellow, "[静音]");
+    }
+    if (encoding_mode && enc_.running) {
+        if (enc_.spout) {
+            ImGui::SameLine();
+            ImGui::TextColored(kGreen, "[Spout]");
+        }
+        if (enc_.vcam) {
+            ImGui::SameLine();
+            ImGui::TextColored(kGreen, "[虚拟摄像头]");
+        }
+        if (enc_.recorder && enc_.recorder->active()) {
+            ImGui::SameLine();
+            ImGui::TextColored(kRed, "[录制中]");
+        }
+        if (export_.running && !export_.for_decode) {
+            ImGui::SameLine();
+            ImGui::TextColored(kYellow, "[导出中]");
+        }
+    } else if (!encoding_mode && export_.running && export_.for_decode) {
+        ImGui::SameLine();
+        ImGui::TextColored(kYellow, "[导出中]");
+    }
+}
+
 void GuiApp::Impl::draw_status_bar() {
     ImGui::Separator();
     if (detached_preview_) {
+        draw_status_badges();
         ImGui::TextDisabled("编码 %.1f fps · 解码 %.1f fps",
                             enc_.running ? enc_.fps : 0.0,
                             dec_.running ? dec_.fps : 0.0);
         return;
     }
-    ImGui::TextDisabled("OBScure v0.3 · 分离窗口 / 文件播放 / 离线导出");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 290);
+    draw_status_badges();
+    ImGui::SameLine(ImGui::GetWindowWidth() - 330);
     ImGui::TextDisabled("编码 %.1f fps · 解码 %.1f fps",
                         enc_.running ? enc_.fps : 0.0,
                         dec_.running ? dec_.fps : 0.0);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 90);
+    if (ImGui::SmallButton("打开日志")) {
+        const std::wstring dir = (fs::path(app_data_dir()) / "logs").wstring();
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 void GuiApp::Impl::open_picker(bool for_decode) {
@@ -3617,10 +3902,15 @@ bool GuiApp::Impl::start_encode() {
         if (enc_.out_record) {
             if (enc_.record_path.empty()) enc_.record_path = make_record_path();
             auto recorder = std::make_unique<FfmpegSink>();
+            const std::string record_encoder = select_video_encoder(
+                VideoCodec::H264, hw_accel_, ffmpeg_tool_path());
             if (!recorder->start(device_.Get(), context_.Get(), 1920, 1080, 60.0,
-                                 record_bitrate_, enc_.record_path, &error)) {
+                                 record_bitrate_, enc_.record_path, &error,
+                                 VideoCodec::H264, record_encoder)) {
                 return fail("录制启动失败: " + error);
             }
+            log_line("record started: encoder=" + record_encoder +
+                     " bitrate=" + std::to_string(record_bitrate_));
             enc_.recorder = std::move(recorder);
         }
 
@@ -3629,8 +3919,10 @@ bool GuiApp::Impl::start_encode() {
             const std::wstring source_file =
                 enc_.source == EncodeState::Source::File ? enc_.file_path : L"";
             if (!start_audio(false, source_file, &audio_error)) {
-                log_line("encode audio failed: " + audio_error);
-                set_error(std::string("音频不可用: ") + audio_error);
+                log_line("encode audio unavailable: " + audio_error);
+                if (!fs::exists(ffmpeg_tool_path())) {
+                    set_error("找不到 ffmpeg.exe，音频与录制/导出不可用。");
+                }
             }
         }
 

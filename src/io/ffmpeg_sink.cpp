@@ -3,10 +3,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <sstream>
+#include <thread>
 
+#include "io/hw_encoder.h"
 #include "platform/win_util.h"
 
 namespace obs {
@@ -18,7 +21,6 @@ std::wstring find_ffmpeg() {
     const fs::path candidates[] = {
         fs::path(exe_dir()) / L"ffmpeg.exe",
         fs::path(exe_dir()).parent_path() / L"ffmpeg.exe",
-        fs::path(L"D:/program/OBScure/ffmpeg.exe"),
     };
     std::error_code ec;
     for (const auto& path : candidates) {
@@ -52,7 +54,7 @@ FfmpegSink::~FfmpegSink() {
 bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int width,
                        int height, double fps, double bitrate_mbps,
                        const std::wstring& output, std::string* error,
-                       VideoCodec codec) {
+                       VideoCodec codec, const std::string& encoder) {
     stop();
     if (!device || !context || width <= 0 || height <= 0) {
         if (error) *error = "ffmpeg sink: bad frame size";
@@ -73,10 +75,15 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(device->CreateTexture2D(&desc, nullptr, staging_.GetAddressOf()))) {
-        if (error) *error = "ffmpeg sink: staging texture failed";
-        return false;
+    for (auto& staging : staging_) {
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf()))) {
+            if (error) *error = "ffmpeg sink: staging texture failed";
+            stop();
+            return false;
+        }
     }
+    next_slot_ = 0;
+    pending_slots_.clear();
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -101,28 +108,20 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
                    [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
     const bool mp4_like = ext == L".mp4" || ext == L".mov";
 
+    encoder_ = encoder.empty() ? (codec_ == VideoCodec::H265
+                                      ? "libx265"
+                                      : codec_ == VideoCodec::Av1 ? "libsvtav1"
+                                                                  : "libx264")
+                               : encoder;
+    const std::string args = video_encoder_args(encoder_, br, 60, mp4_like);
+
     std::wostringstream cmd;
     cmd << quote_arg(find_ffmpeg())
         << L" -hide_banner -loglevel error -y"
         << L" -f rawvideo -pixel_format bgra -video_size " << width_ << L"x" << height_
-        << L" -framerate " << fps << L" -i - -an";
-    if (codec_ == VideoCodec::Av1) {
-        cmd << L" -c:v libsvtav1 -preset 8"
-            << L" -b:v " << br << L"M";
-        if (mp4_like) cmd << L" -tag:v av01";
-    } else if (codec_ == VideoCodec::H265) {
-        cmd << L" -c:v libx265 -preset medium"
-            << L" -b:v " << br << L"M -maxrate " << br << L"M -bufsize " << (br * 2)
-            << L"M"
-            << L" -x265-params keyint=60:min-keyint=60:scenecut=0:log-level=error";
-        if (mp4_like) cmd << L" -tag:v hvc1";
-    } else {
-        cmd << L" -c:v libx264 -preset veryfast"
-            << L" -b:v " << br << L"M -minrate " << br << L"M -maxrate " << br
-            << L"M -bufsize " << (br * 2) << L"M -x264-params nal-hrd=cbr"
-            << L" -keyint_min 60 -sc_threshold 0";
-    }
-    cmd << L" -pix_fmt yuv420p -g 60 " << quote_arg(output);
+        << L" -framerate " << fps << L" -i - -an"
+        << std::wstring(args.begin(), args.end())
+        << L" -pix_fmt yuv420p -g 60 " << quote_arg(output);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -132,6 +131,7 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
     si.hStdError = stderr_write;
     PROCESS_INFORMATION pi{};
     std::wstring command = cmd.str();
+    command_line_ = wide_to_utf8(command);
     std::vector<wchar_t> mutable_cmd(command.begin(), command.end());
     mutable_cmd.push_back(L'\0');
     const BOOL created = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE,
@@ -159,11 +159,10 @@ bool FfmpegSink::start(ID3D11Device* device, ID3D11DeviceContext* context, int w
     return true;
 }
 
-void FfmpegSink::write(ID3D11Texture2D* texture) {
-    if (!process_ || !texture || !context_ || !staging_) return;
-    context_->CopyResource(staging_.Get(), texture);
+void FfmpegSink::emit_slot(int slot) {
+    if (slot < 0 || slot >= 3 || !staging_[slot] || !context_) return;
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (FAILED(context_->Map(staging_[slot].Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         return;
     }
     std::vector<uint8_t> frame(static_cast<size_t>(width_) * height_ * 4);
@@ -173,13 +172,39 @@ void FfmpegSink::write(ID3D11Texture2D* texture) {
                         static_cast<size_t>(y) * mapped.RowPitch,
                     static_cast<size_t>(width_) * 4);
     }
-    context_->Unmap(staging_.Get(), 0);
+    context_->Unmap(staging_[slot].Get(), 0);
 
     std::unique_lock lock(mutex_);
     space_cv_.wait(lock, [this] { return stop_ || failed_ || queue_.size() < 3; });
     if (stop_ || failed_) return;
     queue_.push_back(std::move(frame));
     cv_.notify_one();
+}
+
+void FfmpegSink::write(ID3D11Texture2D* texture) {
+    if (!process_ || !texture || !context_) return;
+    {
+        std::lock_guard lock(mutex_);
+        if (stop_ || failed_) return;
+    }
+    const int slot = next_slot_;
+    next_slot_ = (next_slot_ + 1) % 3;
+    if (!staging_[slot]) return;
+    // Copy into a staging texture now; the map for this slot happens two calls
+    // later so the GPU has finished the copy without stalling the caller.
+    context_->CopyResource(staging_[slot].Get(), texture);
+
+    int ready = -1;
+    {
+        std::lock_guard lock(mutex_);
+        if (stop_ || failed_) return;
+        pending_slots_.push_back(slot);
+        if (pending_slots_.size() > 2) {
+            ready = pending_slots_.front();
+            pending_slots_.pop_front();
+        }
+    }
+    if (ready >= 0) emit_slot(ready);
 }
 
 void FfmpegSink::writer_loop() {
@@ -200,9 +225,14 @@ void FfmpegSink::writer_loop() {
         if (!WriteFile(static_cast<HANDLE>(stdin_write_), frame.data(),
                        static_cast<DWORD>(frame.size()), &written, nullptr) ||
             written != frame.size()) {
+            const DWORD code = GetLastError();
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
             std::lock_guard lock(mutex_);
             failed_ = true;
-            error_ = "ffmpeg sink: write failed";
+            error_ = "ffmpeg sink: write failed (" + std::to_string(code) + ")";
+            if (!stderr_text_.empty()) {
+                error_ += " · " + tail(stderr_text_, 400);
+            }
             cv_.notify_all();
             space_cv_.notify_all();
             return;
@@ -230,6 +260,18 @@ void FfmpegSink::stderr_loop() {
 void FfmpegSink::stop() {
     if (!process_) {
         return;
+    }
+    // Flush the frames still inside the three-slot rotation so short recordings
+    // keep every frame.
+    for (;;) {
+        int slot = -1;
+        {
+            std::lock_guard lock(mutex_);
+            if (pending_slots_.empty() || failed_) break;
+            slot = pending_slots_.front();
+            pending_slots_.pop_front();
+        }
+        emit_slot(slot);
     }
     {
         std::lock_guard lock(mutex_);
@@ -260,7 +302,8 @@ void FfmpegSink::stop() {
         std::lock_guard lock(mutex_);
         error_ = "ffmpeg failed: " + tail(stderr_text_, 600);
     }
-    staging_.Reset();
+    for (auto& staging : staging_) staging.Reset();
+    pending_slots_.clear();
     device_.Reset();
     context_.Reset();
 }

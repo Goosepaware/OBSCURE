@@ -14,7 +14,7 @@ std::wstring resolve_shader_path(const std::wstring& file_name) {
     const fs::path candidates[] = {
         fs::path(exe) / L"shaders" / file_name,
         fs::path(exe).parent_path() / L"shaders" / file_name,
-        fs::path(L"D:/program/OBScure/shaders") / file_name,
+        fs::current_path() / L"shaders" / file_name,
     };
     for (const auto& path : candidates) {
         std::error_code ec;

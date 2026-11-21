@@ -16,7 +16,8 @@ public:
     FfmpegWriter& operator=(const FfmpegWriter&) = delete;
 
     bool open(const std::string& ffmpeg, const std::string& output, int width,
-              int height, double fps, double bitrate_mbps, bool use_crf = false);
+              int height, double fps, double bitrate_mbps, bool use_crf = false,
+              const std::string& encoder = std::string());
     bool write(const cv::Mat& bgr);
     bool close();
     bool is_open() const { return pipe_ != nullptr; }

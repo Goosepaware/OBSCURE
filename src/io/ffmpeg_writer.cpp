@@ -6,6 +6,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "io/hw_encoder.h"
+
 namespace obs {
 
 namespace {
@@ -24,7 +26,8 @@ FfmpegWriter::~FfmpegWriter() {
 }
 
 bool FfmpegWriter::open(const std::string& ffmpeg, const std::string& output, int width,
-                        int height, double fps, double bitrate_mbps, bool use_crf) {
+                        int height, double fps, double bitrate_mbps, bool use_crf,
+                        const std::string& encoder) {
     close();
     width_ = width;
     height_ = height;
@@ -33,14 +36,13 @@ bool FfmpegWriter::open(const std::string& ffmpeg, const std::string& output, in
     std::ostringstream cmd;
     cmd << quote_if_needed(ffmpeg) << " -hide_banner -loglevel error -y"
         << " -f rawvideo -pix_fmt bgr24 -s " << width << "x" << height
-        << " -r " << fps << " -i - -an"
-        << " -c:v libx264 -preset veryfast";
+        << " -r " << fps << " -i - -an";
     if (use_crf) {
-        cmd << " -crf 16";
+        // CRF is an x264/x265 concept; hardware encoders use the CBR path.
+        cmd << " -c:v libx264 -preset veryfast -crf 16";
     } else {
-        const double br = bitrate_mbps > 0 ? bitrate_mbps : 8.0;
-        cmd << " -b:v " << br << "M -minrate " << br << "M -maxrate " << br
-            << "M -bufsize " << (br * 2) << "M -x264-params nal-hrd=cbr";
+        const std::string name = encoder.empty() ? "libx264" : encoder;
+        cmd << video_encoder_args(name, bitrate_mbps, 60, false);
     }
     cmd << " -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0"
         << " -movflags +faststart " << quote_if_needed(output);

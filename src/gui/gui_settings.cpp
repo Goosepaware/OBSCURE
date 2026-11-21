@@ -100,6 +100,9 @@ bool load_gui_settings(GuiSettings* settings) {
     settings->export_path_decode = parse_wide(values, "export_path_decode");
     settings->export_source_encode = parse_wide(values, "export_source_encode");
     settings->export_source_decode = parse_wide(values, "export_source_decode");
+    settings->record_bitrate =
+        parse_int(values, "record_bitrate", settings->record_bitrate);
+    if (values.count("hw_accel")) settings->hw_accel = values["hw_accel"];
     settings->player_loop = parse_bool(values, "player_loop", settings->player_loop);
     settings->audio_device_id = parse_wide(values, "audio_device_id");
     settings->audio_muted = parse_bool(values, "audio_muted", settings->audio_muted);
@@ -149,6 +152,8 @@ bool save_gui_settings(const GuiSettings& settings) {
     out << "export_path_decode=" << wide_to_utf8(settings.export_path_decode) << "\n";
     out << "export_source_encode=" << wide_to_utf8(settings.export_source_encode) << "\n";
     out << "export_source_decode=" << wide_to_utf8(settings.export_source_decode) << "\n";
+    out << "record_bitrate=" << settings.record_bitrate << "\n";
+    out << "hw_accel=" << settings.hw_accel << "\n";
     out << "player_loop=" << (settings.player_loop ? 1 : 0) << "\n";
     out << "audio_device_id=" << wide_to_utf8(settings.audio_device_id) << "\n";
     out << "audio_volume=" << settings.audio_volume << "\n";

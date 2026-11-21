@@ -17,9 +17,10 @@ struct PreviewPlayerCommand {
 
 // Resizable top-level preview window used when the playback picture is
 // detached from the main console. The picture is letterboxed to preserve its
-// aspect ratio. A compact player bar (play/pause, seek, time, loop) sits below
-// the video. F8 toggles always-on-top; WM_CLOSE hides the window so the
-// console can show it again.
+// aspect ratio. A compact player bar (play/pause, seek, time, loop, mute,
+// volume) sits below the video. F8 toggles always-on-top, F11 toggles
+// borderless fullscreen, the mouse wheel adjusts volume; WM_CLOSE hides the
+// window so the console can show it again.
 class PreviewWindow {
 public:
     PreviewWindow() = default;
@@ -43,6 +44,9 @@ public:
     void get_window_rect(RECT* rect) const;
     void set_window_rect(const RECT& rect);
     void set_title(const std::wstring& title);
+    bool fullscreen() const { return fullscreen_; }
+    // Normal (non-fullscreen) frame, so settings never persist the fullscreen rect.
+    void get_restore_rect(RECT* rect) const;
 
     // Player bar. visible=false hides the bar and gives the full client area to
     // the video. Commands are applied by the main loop via take_player_command.
@@ -57,6 +61,8 @@ private:
     void resize_swapchain(int width, int height);
     void layout_player();
     void update_player_controls();
+    void toggle_fullscreen();
+    void adjust_volume(float delta);
     static std::wstring format_time(double ms);
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
@@ -76,6 +82,10 @@ private:
     HWND volume_trackbar_ = nullptr;
     HBRUSH dark_brush_ = nullptr;
     bool topmost_ = false;
+    bool fullscreen_ = false;
+    LONG_PTR saved_style_ = 0;
+    LONG_PTR saved_ex_style_ = 0;
+    RECT saved_rect_{};
     std::wstring title_;
 
     bool player_visible_ = false;

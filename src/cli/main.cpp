@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
@@ -27,6 +29,7 @@
 #include "core/transform.h"
 #include "io/ffmpeg_audio.h"
 #include "io/ffmpeg_writer.h"
+#include "io/hw_encoder.h"
 
 namespace fs = std::filesystem;
 
@@ -55,6 +58,7 @@ void usage() {
         << "  --frames N           process at most N frames (0 = all)\n"
         << "  --start SEC          seek before reading\n"
         << "  --ffmpeg PATH        ffmpeg executable\n"
+        << "  --encoder NAME       auto (default), nvenc, qsv, amf, or cpu\n"
         << "  --margin auto|0|1|2  decoder guard-band inset (default auto)\n"
         << "  --no-detect          decode assuming the exact canonical frame\n"
         << "  --dump-every N       write transport/restored PNGs every N frames\n"
@@ -96,8 +100,16 @@ double get_double(const std::map<std::string, std::string>& a, const std::string
 }
 
 std::string default_ffmpeg() {
-    const fs::path p = "D:/program/OBScure/ffmpeg.exe";
-    if (fs::exists(p)) return p.string();
+    wchar_t module[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(nullptr, module, MAX_PATH * 4);
+    if (len > 0) {
+        const fs::path dir = fs::path(module).parent_path();
+        std::error_code ec;
+        for (const fs::path& candidate :
+             {dir / L"ffmpeg.exe", dir.parent_path() / L"ffmpeg.exe"}) {
+            if (fs::exists(candidate, ec)) return candidate.string();
+        }
+    }
     return "ffmpeg";
 }
 
@@ -588,6 +600,7 @@ int main(int argc, char** argv) {
     const std::string key_text =
         public_key ? std::string(obs::kPublicKey) : get(args, "key", "obscure-demo-key");
     const std::string ffmpeg = get(args, "ffmpeg", default_ffmpeg());
+    const std::string encoder_pref = get(args, "encoder", "auto");
     const bool audio_enabled = args.find("no-audio") == args.end();
     const int audio_algorithm =
         obs::audio_algorithm_from_id(get(args, "audio-mode", "subband"));
@@ -682,8 +695,17 @@ int main(int argc, char** argv) {
         if (write_output) {
             const int out_w = mode == "encode" ? layout.canvas_w : layout.ref_w();
             const int out_h = mode == "encode" ? layout.canvas_h : layout.ref_h();
+            const std::wstring ffmpeg_wide(ffmpeg.begin(), ffmpeg.end());
+            const std::string ext = final_path.extension().string();
+            const obs::VideoCodec codec =
+                ext == ".h265" || ext == ".hevc" ? obs::VideoCodec::H265
+                : ext == ".av1"                   ? obs::VideoCodec::Av1
+                                                  : obs::VideoCodec::H264;
+            const std::string encoder = obs::select_video_encoder(
+                codec, obs::hw_accel_from_id(encoder_pref), ffmpeg_wide);
+            std::cout << "[encoder] " << encoder << "\n";
             if (!writer.open(ffmpeg, video_path.string(), out_w, out_h, fps, bitrate,
-                             mode == "decode")) {
+                             mode == "decode", encoder)) {
                 throw std::runtime_error(writer.error());
             }
         }

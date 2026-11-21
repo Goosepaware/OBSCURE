@@ -69,6 +69,14 @@ LRESULT CALLBACK PreviewWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 self->set_topmost(!self->topmost_);
                 return 0;
             }
+            if (wp == VK_F11) {
+                self->toggle_fullscreen();
+                return 0;
+            }
+            if (wp == VK_ESCAPE && self->fullscreen_) {
+                self->toggle_fullscreen();
+                return 0;
+            }
             if (wp == VK_SPACE) {
                 self->pending_command_.type = PreviewPlayerCommand::Type::TogglePause;
                 return 0;
@@ -140,6 +148,12 @@ LRESULT CALLBACK PreviewWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 self->pending_command_.value = ms;
                 self->update_player_controls();
             }
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            if (!self) break;
+            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            if (delta != 0) self->adjust_volume(delta > 0 ? 0.05f : -0.05f);
             return 0;
         }
         case WM_CTLCOLORSTATIC: {
@@ -597,6 +611,51 @@ void PreviewWindow::set_window_rect(const RECT& rect) {
     if (width < 320 || height < 180) return;
     SetWindowPos(hwnd_, nullptr, rect.left, rect.top, width, height,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void PreviewWindow::get_restore_rect(RECT* rect) const {
+    if (!rect) return;
+    if (fullscreen_) {
+        *rect = saved_rect_;
+    } else {
+        get_window_rect(rect);
+    }
+}
+
+void PreviewWindow::toggle_fullscreen() {
+    if (!hwnd_) return;
+    if (!fullscreen_) {
+        saved_style_ = GetWindowLongPtrW(hwnd_, GWL_STYLE);
+        saved_ex_style_ = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+        GetWindowRect(hwnd_, &saved_rect_);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &info)) {
+            SetWindowLongPtrW(hwnd_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(hwnd_, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top,
+                         info.rcMonitor.right - info.rcMonitor.left,
+                         info.rcMonitor.bottom - info.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            fullscreen_ = true;
+        }
+    } else {
+        SetWindowLongPtrW(hwnd_, GWL_STYLE, saved_style_);
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, saved_ex_style_);
+        SetWindowPos(hwnd_, nullptr, saved_rect_.left, saved_rect_.top,
+                     saved_rect_.right - saved_rect_.left,
+                     saved_rect_.bottom - saved_rect_.top,
+                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        fullscreen_ = false;
+    }
+    layout_player();
+}
+
+void PreviewWindow::adjust_volume(float delta) {
+    player_volume_ = std::clamp(player_volume_ + delta, 0.0f, 2.0f);
+    player_muted_ = player_volume_ < 0.01f;
+    update_player_controls();
+    pending_command_.type = PreviewPlayerCommand::Type::SetVolume;
+    pending_command_.value = player_volume_;
 }
 
 void PreviewWindow::set_title(const std::wstring& title) {

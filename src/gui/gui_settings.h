@@ -33,6 +33,9 @@ struct GuiSettings {
     std::wstring export_source_encode;
     std::wstring export_source_decode;
 
+    int record_bitrate = 8;
+    std::string hw_accel = "auto";  // auto / nvenc / qsv / amf / cpu
+
     bool player_loop = true;
 
     std::wstring audio_device_id;

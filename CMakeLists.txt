@@ -48,6 +48,7 @@ add_executable(obscure-cli
     src/platform/wav_writer.cpp
     src/io/ffmpeg_writer.cpp
     src/io/ffmpeg_audio.cpp
+    src/io/hw_encoder.cpp
     src/cli/main.cpp
 )
 
@@ -220,6 +221,7 @@ add_executable(obscure-gui
     src/live/vcam_registry.cpp
     src/io/ffmpeg_sink.cpp
     src/io/ffmpeg_audio.cpp
+    src/io/hw_encoder.cpp
     ${SPOUT_SOURCES}
 )
 target_compile_definitions(obscure-gui PRIVATE SPOUT_BUILD_STATIC)
