@@ -48,3 +48,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# Local agent instructions
+/AGENTS.md
