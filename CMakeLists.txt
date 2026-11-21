@@ -250,12 +250,24 @@ add_custom_command(TARGET obscure-gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/shaders"
         "$<TARGET_FILE_DIR:obscure-gui>/shaders"
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        "$<TARGET_FILE_DIR:obscure-gui>/vcam"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:obscure-vcam>"
-        "$<TARGET_FILE_DIR:obscure-gui>/vcam/obscure-vcam.dll"
 )
+
+# Deploy the filter DLL even when obscure-gui itself does not relink. The old
+# POST_BUILD copy only ran on a gui relink, which silently left a stale camera
+# DLL in place after vcam-only changes.
+set(VCAM_DEPLOY_DIR "${CMAKE_BINARY_DIR}/vcam")
+set(VCAM_DEPLOY_DLL "${VCAM_DEPLOY_DIR}/obscure-vcam.dll")
+add_custom_command(
+    OUTPUT "${VCAM_DEPLOY_DLL}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${VCAM_DEPLOY_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:obscure-vcam>" "${VCAM_DEPLOY_DLL}"
+    DEPENDS obscure-vcam
+    COMMENT "Deploying OBScure virtual camera DLL"
+    VERBATIM
+)
+add_custom_target(obscure-vcam-deploy ALL DEPENDS "${VCAM_DEPLOY_DLL}")
+add_dependencies(obscure-gui obscure-vcam-deploy)
 
 add_executable(spout-smoke
     src/live/spout_smoke.cpp

@@ -788,23 +788,38 @@ private:
 			g.DrawPath(&cardBorder, &cardPath);
 		}
 
-		// Logo on the left of the card
-		const float logoSize = 200.0f * s;
-		const float logoX = cardX + 64.0f * s;
+		// Logo + typography, centred as one group inside the card
+		const float logoSize = 196.0f * s;
+		const float gap = 46.0f * s;
+		Gdiplus::FontFamily fontFam(L"Microsoft YaHei");
+		Gdiplus::Font titleFont(&fontFam, max(12.0f, 46.0f * s), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+		Gdiplus::Font subFont(&fontFam, max(10.0f, 27.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+		Gdiplus::Font pillFont(&fontFam, max(9.0f, 17.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+
+		const wchar_t* statusText = stopped ? L"已停止输出 · 等待重新连接" : L"待机中 · 等待 OBScure 编码输出";
+		const wchar_t* titleText = L"OBScure";
+		const wchar_t* subText = L"实时音视频混淆解决方案";
+
+		auto measure = [&](const wchar_t* text, Gdiplus::Font* font) {
+			Gdiplus::RectF bounds;
+			g.MeasureString(text, -1, font, Gdiplus::PointF(0, 0), &bounds);
+			return bounds.Width;
+		};
+		const float titleW = measure(titleText, &titleFont);
+		const float subW = measure(subText, &subFont);
+		const float pillPad = 30.0f * s;
+		const float pillW = measure(statusText, &pillFont) + pillPad * 2.0f;
+		const float textW = max(max(titleW, subW), pillW);
+		const float contentW = logoSize + gap + textW;
+		const float groupX = cardX + max(0.0f, (cardW - contentW) * 0.5f);
+		const float logoX = groupX;
 		const float logoY = cy - logoSize * 0.5f;
+		const float textX = groupX + logoSize + gap;
 		{
 			Gdiplus::Bitmap logoBmp(kStandbyLogoW, kStandbyLogoH, kStandbyLogoW * 4,
 				PixelFormat32bppARGB, const_cast<BYTE*>(kStandbyLogoBGRA));
 			g.DrawImage(&logoBmp, logoX, logoY, logoSize, logoSize);
 		}
-
-		// Typography on the right of the logo
-		const float textX = logoX + logoSize + 48.0f * s;
-		const float textW = (cardX + cardW) - textX - 40.0f * s;
-		Gdiplus::FontFamily fontFam(L"Microsoft YaHei");
-		Gdiplus::Font titleFont(&fontFam, max(12.0f, 44.0f * s), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-		Gdiplus::Font subFont(&fontFam, max(10.0f, 28.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-		Gdiplus::Font pillFont(&fontFam, max(9.0f, 18.0f * s), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
 
 		Gdiplus::SolidBrush whiteBrush(Gdiplus::Color(255, 240, 246, 252));
 		Gdiplus::SolidBrush accentBrush(Gdiplus::Color(255, 56, 189, 248));
@@ -814,20 +829,38 @@ private:
 		sf.SetAlignment(Gdiplus::StringAlignmentNear);
 		sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
 
-		g.DrawString(L"OBScure", -1, &titleFont,
-			Gdiplus::RectF(textX, cy - 86.0f * s, textW, 58.0f * s), &sf, &whiteBrush);
-		g.DrawString(L"实时音视频混淆解决方案", -1, &subFont,
-			Gdiplus::RectF(textX, cy - 22.0f * s, textW, 44.0f * s), &sf, &accentBrush);
+		// Thin accent bar to the left of the title block
+		const float barX = textX - 18.0f * s;
+		const float barTop = cy - 74.0f * s;
+		const float barH = 118.0f * s;
+		{
+			Gdiplus::LinearGradientBrush barBrush(
+				Gdiplus::Point(static_cast<int>(barX), static_cast<int>(barTop)),
+				Gdiplus::Point(static_cast<int>(barX), static_cast<int>(barTop + barH)),
+				Gdiplus::Color(255, 34, 211, 238),
+				Gdiplus::Color(30, 34, 211, 238));
+			g.FillRectangle(&barBrush, barX, barTop, max(2.0f, 4.0f * s), barH);
+		}
+
+		g.DrawString(titleText, -1, &titleFont,
+			Gdiplus::RectF(textX, cy - 84.0f * s, textW + 4.0f, 62.0f * s), &sf, &whiteBrush);
+		g.DrawString(subText, -1, &subFont,
+			Gdiplus::RectF(textX, cy - 16.0f * s, textW + 4.0f, 42.0f * s), &sf, &accentBrush);
 
 		// Status pill
-		const wchar_t* statusText = stopped ? L"已停止输出 · 等待重新连接" : L"待机中 · 等待 OBScure 编码输出";
-		const float pillY = cy + 40.0f * s;
-		const float pillH = 34.0f * s;
-		const float pillW = min(textW, 310.0f * s);
-		Gdiplus::SolidBrush pillBg(Gdiplus::Color(40, 56, 189, 248));
-		Gdiplus::Pen pillBorder(Gdiplus::Color(100, 56, 189, 248), max(1.0f, 1.0f * s));
-		g.FillRectangle(&pillBg, textX, pillY, pillW, pillH);
-		g.DrawRectangle(&pillBorder, textX, pillY, pillW, pillH);
+		const float pillH = 36.0f * s;
+		const float pillY = cy + 46.0f * s;
+		const float pillRadius = pillH * 0.5f;
+		{
+			Gdiplus::GraphicsPath pillPath;
+			pillPath.AddArc(textX, pillY, pillRadius * 2, pillH, 90, 180);
+			pillPath.AddArc(textX + pillW - pillRadius * 2, pillY, pillRadius * 2, pillH, 270, 180);
+			pillPath.CloseFigure();
+			Gdiplus::SolidBrush pillBg(Gdiplus::Color(38, 56, 189, 248));
+			Gdiplus::Pen pillBorder(Gdiplus::Color(110, 56, 189, 248), max(1.0f, 1.0f * s));
+			g.FillPath(&pillBg, &pillPath);
+			g.DrawPath(&pillBorder, &pillPath);
+		}
 		Gdiplus::StringFormat pillSf;
 		pillSf.SetAlignment(Gdiplus::StringAlignmentCenter);
 		pillSf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
