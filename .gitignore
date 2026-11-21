@@ -2,24 +2,33 @@
 /build/
 /out/
 
-# Large local assets
+# Local test assets and captures
 /sample/
-/third_party/
 /work/tools/
+/work/*.log
 
-# FFmpeg shared build
+# ffmpeg shared runtime placed next to the built executables
 /*.exe
 /*.dll
+
+# Heavy OpenCV source/build trees (see work/build_opencv.bat)
+/third_party/opencv/
+/third_party/opencv-build/
+/third_party/opencv-install/
+/third_party/opencv_contrib/
+
+# Vendored prebuilt binaries and example dependencies we do not build
+/third_party/imgui/examples/libs/
+/third_party/Spout2/SPOUTSDK/SpoutLibrary/Binaries/
+/third_party/Spout2/**/Tutorial*/bin/
+/third_party/Spout2/**/Tutorial*/lib/
+/third_party/UnityCapture/Install/
+/third_party/Spout2/SPOUTSDK/Examples/
 
 # Logs and archives
 *.log
 *.zip
 *.7z
-
-# Test artifacts
-*.mp4
-*.png
-*.bmp
 
 # Python
 __pycache__/
