@@ -195,6 +195,7 @@ add_executable(obscure-gui
     src/gui/main.cpp
     src/gui/gui_app.cpp
     src/gui/gui_settings.cpp
+    src/gui/obscure.rc
     src/platform/win_util.cpp
     src/platform/wasapi_audio.cpp
     src/platform/wav_reader.cpp

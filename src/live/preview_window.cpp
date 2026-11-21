@@ -223,7 +223,13 @@ bool PreviewWindow::init(ID3D11Device* device, ID3D11DeviceContext* context,
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = &PreviewWindow::wnd_proc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    HICON app_icon = static_cast<HICON>(LoadImageW(
+        wc.hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    HICON app_icon_sm = static_cast<HICON>(LoadImageW(
+        wc.hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    wc.hIcon = app_icon ? app_icon : LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hIconSm = app_icon_sm ? app_icon_sm : wc.hIcon;
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = kClassName;

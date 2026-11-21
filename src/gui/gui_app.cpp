@@ -1056,7 +1056,13 @@ bool GuiApp::Impl::init_window(HINSTANCE instance) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = &Impl::wnd_proc;
     wc.hInstance = instance;
-    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    HICON app_icon = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    HICON app_icon_sm = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    wc.hIcon = app_icon ? app_icon : LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hIconSm = app_icon_sm ? app_icon_sm : wc.hIcon;
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     wc.lpszClassName = L"OBScureGuiWindow";
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
