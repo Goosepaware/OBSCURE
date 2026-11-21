@@ -161,3 +161,15 @@ work\build_cli.bat
 - 使用说明：[docs/USAGE.md](docs/USAGE.md)
 - 传输格式与元数据：[docs/transport-metadata.md](docs/transport-metadata.md)
 
+---
+
+## 许可证
+
+OBScure 本体使用 **MIT License**，见 [LICENSE](LICENSE)。
+
+第三方组件（Dear ImGui、Spout2、UnityCapture、OpenCV、FFmpeg）的许可与说明见
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。
+发布压缩包内附带的 FFmpeg 二进制遵循 GPLv3，完整文本位于
+[docs/licenses/FFMPEG-GPLv3.txt](docs/licenses/FFMPEG-GPLv3.txt)。
+
+
